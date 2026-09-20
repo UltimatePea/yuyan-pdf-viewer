@@ -1,0 +1,6 @@
+源码/值桥接.wat derived from Yuyan 工具/节点网页汇编宿主/值桥接.wat
+Yuyan source commit: 57be1c544e1898540509c9f3c773dd57f9fc8ae6
+License: GNU General Public License, version 3. See LICENSE.
+Node/V8 are dynamically linked from the local Homebrew installation; their upstream license notices accompany that installation.
+第三方/标准库 is an unmodified source snapshot from the same Yuyan commit, included as corresponding source for the standard-library code in the Wasm-GC module. It is covered by the Yuyan GPL-3.0 license in LICENSE.
+The self-contained release bundles Node/V8 and 24 dependent dylibs. Their license texts are included under 阅卷.app/Contents/Resources/ThirdPartyLicenses.
