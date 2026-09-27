@@ -11,6 +11,15 @@ function* delay(ms){let start=Date.now();while(Date.now()-start<ms)yield;}
 const state=()=>api('inspect');
 function* scenario(){
  yield* wait(()=>state().pages===4,'initial open');check(state().watchers===2,'file and parent watchers installed');
+ const initialUpdate=state();const stamp=new Date(initialUpdate.lastUpdatedMs),pad=n=>String(n).padStart(2,'0');
+ const localStamp=`${stamp.getFullYear()}-${pad(stamp.getMonth()+1)}-${pad(stamp.getDate())} ${pad(stamp.getHours())}:${pad(stamp.getMinutes())}:${pad(stamp.getSeconds())}`;
+ check(initialUpdate.status.startsWith('Updated at '+localStamp+' ·'),'status displays system-local date and time including seconds');
+ check(Math.abs(Date.now()-initialUpdate.lastUpdatedMs)<5000,'update timestamp reflects the successful load time');
+ yield* delay(1100);const checkedLoads=state().loads;fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta']));
+ yield* wait(()=>state().loads>checkedLoads&&state().status.startsWith('Updated at '),'identical-content check');
+ check(state().lastUpdatedMs===initialUpdate.lastUpdatedMs&&state().commits===initialUpdate.commits,'identical content preserves the last update timestamp');
+ fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'timestamp update'}));yield* wait(()=>state().commits>initialUpdate.commits,'new content timestamp');
+ check(state().lastUpdatedMs>initialUpdate.lastUpdatedMs+1000&&!state().status.startsWith('Updated at '+localStamp+' ·'),'new content advances the displayed update time');
  let descriptors=fs.readdirSync('/dev/fd').length;
  api('testPosition',[2,1.3,500]);yield* delay(150);let original=state();console.log('POSITION',JSON.stringify(original));check(original.anchor.text.includes('Gamma'),'read Gamma passage');
  let c=original.commits;fs.writeFileSync(file,pdf(['Inserted','Alpha','Beta','Gamma','Delta']));yield* wait(()=>state().commits>c,'in-place insertion');let s=state();console.log('INSERT',s);check(s.anchor.text===original.anchor.text,'inserted page keeps same passage');check(s.anchor.page===original.anchor.page+1,'anchor follows pagination');check(Math.abs(s.zoom-original.zoom)<.001,'zoom preserved');
@@ -18,7 +27,7 @@ function* scenario(){
  for(let i=0;i<3;i++){c=state().commits;fs.writeFileSync(file,pdf(['Inserted','Alpha','Beta','Gamma','Delta'],{revision:String(i)}));yield* wait(()=>state().commits>c,'rewrite '+i);}check(true,'repeated in-place rewrites');
  c=state().commits;const oldino=fs.statSync(file).ino;fs.writeFileSync(file+'.new',pdf(['Alpha','Beta','Gamma','Delta']));fs.renameSync(file+'.new',file);yield* wait(()=>state().commits>c,'atomic replacement');check(fs.statSync(file).ino!==oldino,'replacement changes inode');check(state().anchor.text===original.anchor.text,'page deletion preserves passage');
  c=state().commits;const digest=state().digest;fs.unlinkSync(file);yield* delay(450);check(state().digest===digest&&state().pages===4,'delete keeps last valid document');fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'recreated'}));yield* wait(()=>state().commits>c,'recreate');check(state().watchers===2,'file watcher rearmed after recreation');
- c=state().commits;const before=state().digest;fs.writeFileSync(file,'%PDF-1.4\npartial');yield* delay(450);check(state().digest===before,'partial write keeps last valid PDF');fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'complete'}));yield* wait(()=>state().commits>c,'complete after partial');check(true,'invalid-to-valid retry succeeds');
+ c=state().commits;const before=state().digest,lastGoodTime=state().lastUpdatedMs;fs.writeFileSync(file,'%PDF-1.4\npartial');yield* delay(450);check(state().digest===before,'partial write keeps last valid PDF');check(state().lastUpdatedMs===lastGoodTime,'failed reload preserves the last successful update time');fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'complete'}));yield* wait(()=>state().commits>c,'complete after partial');check(true,'invalid-to-valid retry succeeds');
  c=state().commits;for(let i=0;i<12;i++)fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'burst '+i}));yield* wait(()=>state().commits>c,'rapid builds');yield* delay(600);check(state().commits===c+1,'rapid burst coalesces into one commit');
  api('testDelay',[.65]);c=state().commits;let loads=state().loads;
  fs.writeFileSync(file,pdf(['Old async result'],{revision:'old'}));yield* wait(()=>state().loads>loads,'asynchronous read started');yield* delay(100);

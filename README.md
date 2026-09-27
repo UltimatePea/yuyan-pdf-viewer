@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.0-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.1-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -20,6 +20,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.0-macos-arm64.zip`, then open `阅卷.app` or move 
 - Native continuous scrolling, page navigation, zoom, fit to width, search, text selection and printing.
 - File and directory notifications detect in-place rewrites, atomic replacement and delete/recreate cycles.
 - Debounced reloads retain the last valid PDF through partial writes and reject stale asynchronous results.
+- The bottom status shows the last successful PDF update in system-local time, including seconds (`YYYY-MM-DD HH:mm:ss`); unchanged content does not reset it.
 - Text anchors preserve the reading passage and its viewport position across page insertion/deletion, with coordinate fallback for image-only pages.
 - Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.

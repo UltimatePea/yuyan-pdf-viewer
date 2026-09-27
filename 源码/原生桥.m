@@ -32,6 +32,7 @@ static Viewer *V;
 @property NSTextField *status,*pageField;
 @property NSSearchField *search;
 @property NSString *path,*digest;
+@property NSDate *lastUpdated;
 @property NSArray *lines,*candidateLines,*anchors;
 @property PDFDocument *candidate;
 @property NSString *candidateDigest;
@@ -154,9 +155,9 @@ static Viewer *V;
     dispatch_source_set_event_handler(self.fileWatch,^{if(session==self.session){[self armFileWatch];if(![self.events.lastObject[@"kind"] isEqual:@2])[self enqueue:2 generation:0];}});
     dispatch_source_set_cancel_handler(self.fileWatch,^{close(fd);});dispatch_resume(self.fileWatch);self.watchCount++;
 }
-- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.pdf.document=nil;self.lines=@[];self.candidate=nil;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
+- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.pdf.document=nil;self.lines=@[];self.candidate=nil;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
 - (void)openPath:(NSString *)path {
-    [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;
+    [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;self.lastUpdated=nil;
     self.pdf.document=nil;self.lines=@[];self.candidate=nil;[self.events removeAllObjects];
     self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
@@ -221,12 +222,17 @@ static Viewer *V;
     NSView *dv=self.pdf.documentView;NSClipView *clip=(NSClipView *)dv.superview;
     if([clip isKindOfClass:NSClipView.class]){NSPoint actual=[self.pdf convertPoint:point fromPage:p];NSPoint a=[dv convertPoint:actual fromView:self.pdf];NSPoint b=[dv convertPoint:offset fromView:self.pdf];NSPoint origin=clip.bounds.origin;origin.x+=a.x-b.x;origin.y+=a.y-b.y;[clip scrollToPoint:[clip constrainBoundsRect:(NSRect){origin,clip.bounds.size}].origin];[(NSScrollView *)clip.superview reflectScrolledClipView:clip];}
 }
+- (NSString *)updatedStatus {
+    // 文言：记成卷之时，精确至秒；无变则不改其时。汉语：使用系统当地时间，保留最后成功更新的时间戳。
+    NSDateFormatter *format=[NSDateFormatter new];format.locale=[[NSLocale alloc]initWithLocaleIdentifier:@"en_US_POSIX"];format.calendar=[[NSCalendar alloc]initWithCalendarIdentifier:NSCalendarIdentifierGregorian];format.timeZone=NSTimeZone.localTimeZone;format.dateFormat=@"yyyy-MM-dd HH:mm:ss";
+    return [NSString stringWithFormat:@"Updated at %@ · %lu pages · %@",self.lastUpdated?[format stringFromDate:self.lastUpdated]:@"—",self.pdf.document.pageCount,self.path?:@""];
+}
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
     if(!self.candidate)return;
     BOOL initial=self.pdf.document==nil;self.pdf.document=self.candidate;self.lines=self.candidateLines;self.digest=self.candidateDigest;self.candidate=nil;self.commits++;
     self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
     if(!initial){if(line>=0&&line<self.lines.count){NSDictionary *l=self.lines[line];NSPoint off=anchor>=0&&anchor<self.anchors.count?NSPointFromString(self.anchors[anchor][@"offset"]):self.fallbackOffset;[self positionPage:[l[@"page"] integerValue] point:NSRectFromString(l[@"rect"]).origin offset:off];}else [self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
-    self.status.stringValue=[NSString stringWithFormat:@"Updated · %lu pages · %@",self.pdf.document.pageCount,self.path];[self pageChanged:nil];
+    self.lastUpdated=[NSDate date];self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
     [self refreshJumpMenus];
     [self navigate];
 }
@@ -401,7 +407,7 @@ static Viewer *V;
     if([op isEqual:@"anchorpage"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"page"]:@0;}
     if([op isEqual:@"begin"]){[self begin:[a[0] integerValue]];return @0;}
     if([op isEqual:@"prepare"]){[self capture];return @0;}
-    if([op isEqual:@"unchanged"]){self.status.stringValue=[NSString stringWithFormat:@"Up to date · %@",self.path?:@""];self.candidate=nil;[self navigate];return @0;}
+    if([op isEqual:@"unchanged"]){self.status.stringValue=[self updatedStatus];self.candidate=nil;[self navigate];return @0;}
     if([op isEqual:@"navigate"]){self.navigationSource=a[0];self.navigationLine=[a[1] integerValue];self.navigationSerial++;[self reload:nil];return @0;}
     if([op isEqual:@"commit"]){[self commitLine:[a[0] integerValue] anchor:[a[1] integerValue]];return @0;}
     if([op isEqual:@"finishMatch"])return @([self finishMatch:[a[0] integerValue] anchor:[a[1] integerValue]]);
@@ -421,7 +427,7 @@ static Viewer *V;
     if([op isEqual:@"testDelay"]){self.testDelay=[a[0] doubleValue];return @0;}
     if([op isEqual:@"testFollow"]){self.follow=[a[0] boolValue];return @0;}
     if([op isEqual:@"testMode"]){[self setModePreservingPosition:[a[0] integerValue]];return @0;}
-    if([op isEqual:@"inspect"]){[self capture];return @{@"path":self.path?:@"",@"commits":@(self.commits),@"loads":@(self.loads),@"watchers":@(self.watchCount),@"pages":@(self.pdf.document.pageCount),@"page":@(self.fallbackPage),@"mode":@(self.pdf.displayMode),@"zoom":@(self.pdf.scaleFactor),@"anchor":self.anchors.count?self.anchors[0]:@{},@"digest":self.digest?:@"",@"status":self.status.stringValue?:@""};}
+    if([op isEqual:@"inspect"]){[self capture];return @{@"path":self.path?:@"",@"commits":@(self.commits),@"loads":@(self.loads),@"watchers":@(self.watchCount),@"pages":@(self.pdf.document.pageCount),@"page":@(self.fallbackPage),@"mode":@(self.pdf.displayMode),@"zoom":@(self.pdf.scaleFactor),@"anchor":self.anchors.count?self.anchors[0]:@{},@"digest":self.digest?:@"",@"lastUpdatedMs":@(self.lastUpdated.timeIntervalSince1970*1000),@"status":self.status.stringValue?:@""};}
     return @0;
 }
 @end
