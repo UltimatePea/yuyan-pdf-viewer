@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.1.0-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.0-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -21,9 +21,18 @@ Unzip `Yuyan-PDF-Viewer-v0.1.0-macos-arm64.zip`, then open `阅卷.app` or move 
 - File and directory notifications detect in-place rewrites, atomic replacement and delete/recreate cycles.
 - Debounced reloads retain the last valid PDF through partial writes and reject stale asynchronous results.
 - Text anchors preserve the reading passage and its viewport position across page insertion/deletion, with coordinate fallback for image-only pages.
+- Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.
 
 Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content can fall back to the original page coordinates.
+
+## Jump points
+
+Press **⌘D** or click **Set Point** to save the current reading location instantly. Unnamed points use **A, B, … Z, AA, AB…**, skipping labels already in use. Press **⇧⌘D** or right-click **Set Point** to supply a custom name.
+
+Everything stays on a **single compact toolbar row**, including when no points exist. Saved points appear as small named buttons beside Set Point: click one to jump, or use **⌘1–⌘9** for the first nine points in display order. Right-click a point for **Jump to Point** and **Remove Jump Point**; removal has no shortcut or extra toolbar button. The Jump Points menu also exposes both actions. Scroll the inline point area horizontally when it fills up; it never wraps to another row.
+
+Points are stored separately for each PDF path, survive app restarts, and update their text anchors after successful rebuilds without moving your reading position. Jumping preserves your current zoom and display mode. If the target text is gone or cannot be extracted, the app uses a safely clamped page-coordinate fallback and reports an approximate location. Moving or renaming the PDF does not migrate its saved points. Concurrent app instances editing points for the same PDF use the last saved list.
 
 ## Build and test
 

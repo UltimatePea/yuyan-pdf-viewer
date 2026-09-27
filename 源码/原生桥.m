@@ -54,6 +54,13 @@ static Viewer *V;
 @property NSInteger navigationLine;
 @property NSUInteger navigationSerial;
 @property dispatch_queue_t readQueue;
+@property NSMutableArray<NSMutableDictionary *> *jumpPoints;
+@property NSMenu *jumpMenu;
+@property NSButton *setJumpButton;
+@property NSScrollView *jumpBar;
+@property CGFloat jumpContentWidth;
+@property NSMutableDictionary *matchingJump;
+@property BOOL jumpShouldNavigate;
 @end
 @implementation DropPDF
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {return NSDragOperationCopy;}
@@ -91,6 +98,9 @@ static Viewer *V;
     [self item:@"Next Page" action:@selector(next:) key:@"]" menu:view];
     [self item:@"Single Page / Continuous" action:@selector(mode:) key:@"" menu:view];
     [self item:@"Follow Edits" action:@selector(follow:) key:@"" menu:view];
+    self.jumpPoints=[NSMutableArray new];
+    self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
+    [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(180,100,980,820) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
     self.window.title=@"阅卷 — PDF";self.window.delegate=self; self.window.releasedWhenClosed=NO;
     self.window.minSize=NSMakeSize(760,420);
@@ -101,9 +111,13 @@ static Viewer *V;
     CGFloat x=12;
     NSArray *titles=@[@"Open…",@"‹",@"›",@"−",@"+",@"Fit Width"];
     SEL actions[]={@selector(open:),@selector(previous:),@selector(next:),@selector(zoomOut:),@selector(zoomIn:),@selector(fitWidth:)};
-    for(int i=0;i<titles.count;i++){NSButton *b=[NSButton buttonWithTitle:titles[i] target:self action:actions[i]];b.frame=NSMakeRect(x,782,i==0||i==5?82:36,28);b.autoresizingMask=NSViewMinYMargin;[root addSubview:b];x+=b.frame.size.width+4;}
-    self.pageField=[[NSTextField alloc]initWithFrame:NSMakeRect(x+5,784,65,24)];self.pageField.placeholderString=@"Page";self.pageField.target=self;self.pageField.action=@selector(page:);self.pageField.autoresizingMask=NSViewMinYMargin;[root addSubview:self.pageField];
-    self.search=[[NSSearchField alloc]initWithFrame:NSMakeRect(650,784,315,24)];self.search.placeholderString=@"Find in PDF";self.search.target=self;self.search.action=@selector(search:);self.search.autoresizingMask=NSViewMinXMargin|NSViewMinYMargin;[root addSubview:self.search];
+    for(int i=0;i<titles.count;i++){NSButton *b=[NSButton buttonWithTitle:titles[i] target:self action:actions[i]];b.frame=NSMakeRect(x,782,i==0?64:i==5?68:30,28);b.autoresizingMask=NSViewMinYMargin;[root addSubview:b];x+=b.frame.size.width+4;}
+    self.pageField=[[NSTextField alloc]initWithFrame:NSMakeRect(x+5,784,48,24)];self.pageField.placeholderString=@"Page";self.pageField.target=self;self.pageField.action=@selector(page:);self.pageField.autoresizingMask=NSViewMinYMargin;[root addSubview:self.pageField];
+    self.setJumpButton=[NSButton buttonWithTitle:@"Set Point" target:self action:@selector(quickSetJumpPoint:)];self.setJumpButton.frame=NSMakeRect(350,782,82,28);self.setJumpButton.autoresizingMask=NSViewMinYMargin;self.setJumpButton.toolTip=@"Set jump point (⌘D). Set a named point with ⇧⌘D or right-click.";[root addSubview:self.setJumpButton];
+    self.setJumpButton.menu=[NSMenu new];[self item:@"Set Named Jump Point…" action:@selector(setJumpPoint:) key:@"" menu:self.setJumpButton.menu];
+    self.jumpBar=[[NSScrollView alloc]initWithFrame:NSMakeRect(440,782,0,28)];self.jumpBar.autoresizingMask=NSViewMinYMargin;self.jumpBar.hasHorizontalScroller=YES;self.jumpBar.scrollerStyle=NSScrollerStyleOverlay;self.jumpBar.autohidesScrollers=YES;self.jumpBar.drawsBackground=NO;[root addSubview:self.jumpBar];[self refreshJumpMenus];
+    self.search=[[NSSearchField alloc]initWithFrame:NSMakeRect(650,784,315,24)];self.search.placeholderString=@"Find in PDF";self.search.target=self;self.search.action=@selector(search:);self.search.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;[root addSubview:self.search];
+    [self layoutJumpControls];
     self.status=[NSTextField labelWithString:@"Open a PDF to begin"];self.status.frame=NSMakeRect(12,6,956,18);self.status.autoresizingMask=NSViewWidthSizable;self.status.lineBreakMode=NSLineBreakByTruncatingMiddle;[root addSubview:self.status];
     [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(pageChanged:) name:PDFViewPageChangedNotification object:self.pdf];
     [[NSDistributedNotificationCenter defaultCenter]addObserver:self selector:@selector(navigationRequest:) name:@"org.yuyan.reader.navigate" object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
@@ -111,7 +125,7 @@ static Viewer *V;
 }
 - (void)about:(id)sender {NSAlert *a=[NSAlert new];a.messageText=@"阅卷";a.informativeText=@"Yuyan · Wasm-GC · V8\nNative PDFKit viewer for continuously rebuilt papers.";[a beginSheetModalForWindow:self.window completionHandler:nil];}
 - (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];}
-- (void)windowDidResize:(NSNotification *)n {if(self.fit)[self fitWidth:nil];}
+- (void)windowDidResize:(NSNotification *)n {[self layoutJumpControls];if(self.fit)[self fitWidth:nil];}
 - (void)windowWillClose:(NSNotification *)n {[self closeDocument:nil];self.quitting=YES;}
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {self.quitting=YES;return NSTerminateCancel;}
 - (BOOL)application:(NSApplication *)app openFile:(NSString *)filename {[self openPath:filename];return YES;}
@@ -140,10 +154,11 @@ static Viewer *V;
     dispatch_source_set_event_handler(self.fileWatch,^{if(session==self.session){[self armFileWatch];if(![self.events.lastObject[@"kind"] isEqual:@2])[self enqueue:2 generation:0];}});
     dispatch_source_set_cancel_handler(self.fileWatch,^{close(fd);});dispatch_resume(self.fileWatch);self.watchCount++;
 }
-- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.pdf.document=nil;self.lines=@[];self.candidate=nil;[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
+- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.pdf.document=nil;self.lines=@[];self.candidate=nil;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
 - (void)openPath:(NSString *)path {
     [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;
     self.pdf.document=nil;self.lines=@[];self.candidate=nil;[self.events removeAllObjects];
+    self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
     self.status.stringValue=[@"Opening · " stringByAppendingString:self.path];
     self.fileSignature=nil;[self armDirectoryWatch];
@@ -212,7 +227,137 @@ static Viewer *V;
     self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
     if(!initial){if(line>=0&&line<self.lines.count){NSDictionary *l=self.lines[line];NSPoint off=anchor>=0&&anchor<self.anchors.count?NSPointFromString(self.anchors[anchor][@"offset"]):self.fallbackOffset;[self positionPage:[l[@"page"] integerValue] point:NSRectFromString(l[@"rect"]).origin offset:off];}else [self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
     self.status.stringValue=[NSString stringWithFormat:@"Updated · %lu pages · %@",self.pdf.document.pageCount,self.path];[self pageChanged:nil];
+    [self refreshJumpMenus];
     [self navigate];
+}
+
+// 文言：跳点存于私库，不改原卷；寻锚之策仍归豫言。汉语：持久化与菜单适配，不在此实现文本匹配算法。
+- (NSString *)jumpStorePath {
+    if(!self.path)return nil;
+    NSString *base=NSProcessInfo.processInfo.environment[@"YY_JUMP_POINTS_DIRECTORY"];
+    if(!base.length)base=[[[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask] firstObject].path stringByAppendingPathComponent:@"YuyanPDFViewer/JumpPoints"];
+    return [base stringByAppendingPathComponent:[Digest([self.path dataUsingEncoding:NSUTF8StringEncoding]) stringByAppendingString:@".json"]];
+}
+- (void)loadJumpPoints {
+    self.jumpPoints=[NSMutableArray new];NSData *data=[NSData dataWithContentsOfFile:[self jumpStorePath]];
+    id rows=data?[NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil]:nil;
+    if(![rows isKindOfClass:NSArray.class])return;
+    NSMutableSet *ids=[NSMutableSet new];
+    for(id row in rows){
+        if(![row isKindOfClass:NSMutableDictionary.class])continue;
+        BOOL valid=YES;
+        for(NSString *key in @[@"id",@"name",@"point",@"offset"])if(![row[key] isKindOfClass:NSString.class])valid=NO;
+        for(NSString *key in @[@"page",@"width",@"height",@"scale"])if(![row[key] isKindOfClass:NSNumber.class]||!isfinite([row[key] doubleValue]))valid=NO;
+        if(!valid||![row[@"id"] length]||![row[@"name"] length]||[ids containsObject:row[@"id"]]||[row[@"width"] doubleValue]<=0||[row[@"height"] doubleValue]<=0||[row[@"scale"] doubleValue]<=0)continue;
+        if(![row[@"anchors"] isKindOfClass:NSArray.class]||[row[@"anchors"] count]!=3)continue;
+        for(id anchor in row[@"anchors"]){if(![anchor isKindOfClass:NSDictionary.class]){valid=NO;break;}
+            for(NSString *key in @[@"text",@"offset"])if(![anchor[key] isKindOfClass:NSString.class])valid=NO;
+            if(![anchor[@"page"] isKindOfClass:NSNumber.class])valid=NO;
+        }
+        if(valid){[ids addObject:row[@"id"]];[self.jumpPoints addObject:row];}
+    }
+}
+- (void)saveJumpPoints {
+    NSString *path=[self jumpStorePath];if(!path)return;NSError *error=nil;
+    [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:&error];
+    NSData *data=[NSJSONSerialization dataWithJSONObject:self.jumpPoints options:NSJSONWritingPrettyPrinted error:&error];
+    if(!data||![data writeToFile:path options:NSDataWritingAtomic error:&error])self.status.stringValue=@"Jump points available this session; could not save them";
+}
+- (NSDictionary *)jumpSnapshot {
+    [self capture];return @{@"anchors":self.anchors,@"page":@(self.fallbackPage),@"point":NSStringFromPoint(self.fallbackPoint),@"offset":NSStringFromPoint(self.fallbackOffset),@"width":@(MAX(1,self.pdf.bounds.size.width)),@"height":@(MAX(1,self.pdf.bounds.size.height)),@"scale":@(self.pdf.scaleFactor)};
+}
+- (void)fillJumpMenu:(NSMenu *)menu {
+    [menu removeAllItems];menu.autoenablesItems=NO;
+    NSMenuItem *add=[self item:@"Set Jump Point" action:@selector(quickSetJumpPoint:) key:@"d" menu:menu];add.enabled=self.pdf.document!=nil;
+    NSMenuItem *named=[self item:@"Set Named Jump Point…" action:@selector(setJumpPoint:) key:@"d" menu:menu];named.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagShift;named.enabled=self.pdf.document!=nil;
+    [menu addItem:NSMenuItem.separatorItem];
+    if(!self.jumpPoints.count){NSMenuItem *empty=[menu addItemWithTitle:@"No jump points yet" action:nil keyEquivalent:@""];empty.enabled=NO;}
+    NSUInteger slot=0;for(NSDictionary *point in self.jumpPoints){
+        NSString *title=[NSString stringWithFormat:@"%@ — Page %ld",point[@"name"],(long)[point[@"page"] integerValue]+1];
+        NSMenuItem *item=[menu addItemWithTitle:title action:nil keyEquivalent:@""];NSMenu *actions=[[NSMenu alloc]initWithTitle:title];actions.autoenablesItems=NO;item.submenu=actions;
+        NSString *key=slot<9?[NSString stringWithFormat:@"%lu",(unsigned long)slot+1]:@"";slot++;
+        NSMenuItem *jump=[self item:@"Jump to Point" action:@selector(jumpToPoint:) key:key menu:actions];jump.representedObject=point[@"id"];jump.enabled=self.pdf.document!=nil;
+        NSMenuItem *remove=[self item:@"Remove Jump Point" action:@selector(removeJumpPoint:) key:@"" menu:actions];remove.representedObject=point[@"id"];
+    }
+}
+- (void)refreshJumpMenus {
+    [self fillJumpMenu:self.jumpMenu];self.setJumpButton.enabled=self.pdf.document!=nil;
+    if(!self.jumpBar)return;
+    NSPoint scroll=self.jumpBar.contentView.bounds.origin;NSView *row=[[NSView alloc]initWithFrame:NSMakeRect(0,0,1,28)];CGFloat x=0;
+    NSUInteger slot=0;for(NSDictionary *point in self.jumpPoints){
+        NSString *key=slot<9?[NSString stringWithFormat:@"  ⌘%lu",(unsigned long)slot+1]:@"";
+        NSString *title=point[@"name"];CGFloat width=MIN(116,MAX(28,[title sizeWithAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:13]}].width+18));
+        NSButton *jump=[NSButton buttonWithTitle:title target:self action:@selector(jumpButton:)];jump.frame=NSMakeRect(x,1,width,26);jump.identifier=point[@"id"];jump.enabled=self.pdf.document!=nil;[jump.cell setLineBreakMode:NSLineBreakByTruncatingTail];jump.toolTip=[NSString stringWithFormat:@"Jump to %@ — Page %ld%@",point[@"name"],(long)[point[@"page"] integerValue]+1,key];[row addSubview:jump];
+        NSMenu *context=[NSMenu new];context.autoenablesItems=NO;
+        NSMenuItem *go=[self item:@"Jump to Point" action:@selector(jumpToPoint:) key:@"" menu:context];go.representedObject=point[@"id"];go.enabled=self.pdf.document!=nil;
+        NSMenuItem *remove=[self item:@"Remove Jump Point" action:@selector(removeJumpPoint:) key:@"" menu:context];remove.representedObject=point[@"id"];jump.menu=context;
+        [jump setAccessibilityLabel:[NSString stringWithFormat:@"Jump to %@%@",point[@"name"],key]];x+=width+4;slot++;
+    }
+    self.jumpContentWidth=x;[self layoutJumpControls];row.frame=NSMakeRect(0,0,MAX(x,self.jumpBar.contentSize.width),28);self.jumpBar.documentView=row;
+    [self.jumpBar.contentView scrollToPoint:[self.jumpBar.contentView constrainBoundsRect:(NSRect){scroll,self.jumpBar.contentView.bounds.size}].origin];
+}
+- (void)layoutJumpControls {
+    if(!self.jumpBar)return;
+    NSSize size=self.window.contentView.bounds.size;CGFloat available=MAX(0,size.width-452);
+    CGFloat width=self.jumpPoints.count?MIN(self.jumpContentWidth,MAX(0,available-168)):0;
+    self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(440,size.height-38,width,28);
+    CGFloat searchX=440+width+(self.jumpPoints.count?8:0);self.search.frame=NSMakeRect(searchX,size.height-36,MAX(0,size.width-searchX-12),24);
+}
+- (void)jumpButton:(NSButton *)sender {NSMenuItem *item=[NSMenuItem new];item.representedObject=sender.identifier;[self jumpToPoint:item];}
+- (void)quickSetJumpPoint:(id)sender {if(self.pdf.document)[self queueJumpName:@"" snapshot:[self jumpSnapshot]];}
+- (void)queueJumpName:(NSString *)name snapshot:(NSDictionary *)snapshot {
+    [self.events addObject:@{@"kind":@6,@"name":[name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet],@"location":snapshot}];
+}
+- (void)setJumpPoint:(id)sender {
+    if(!self.pdf.document)return;
+    NSDictionary *snapshot=[self jumpSnapshot];NSUInteger session=self.session;
+    NSAlert *alert=[NSAlert new];alert.messageText=@"Set Jump Point";alert.informativeText=@"Save the current reading location. Give it a name, or leave it blank for an automatic label (A, B, C…).";
+    [alert addButtonWithTitle:@"Set Jump Point"];[alert addButtonWithTitle:@"Cancel"];
+    NSTextField *name=[[NSTextField alloc]initWithFrame:NSMakeRect(0,0,320,24)];name.placeholderString=@"Name (optional)";alert.accessoryView=name;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){if(response==NSAlertFirstButtonReturn&&session==self.session)[self queueJumpName:name.stringValue snapshot:snapshot];}];
+    [alert.window makeFirstResponder:name];
+}
+- (void)addJumpPointNamed:(NSString *)name {
+    if(!self.pdf.document||!self.event[@"location"])return;
+    NSMutableDictionary *point=[self.event[@"location"] mutableCopy];point[@"id"]=NSUUID.UUID.UUIDString;point[@"name"]=name;
+    [self.jumpPoints addObject:point];self.status.stringValue=[NSString stringWithFormat:@"Jump point %@ saved",name];[self saveJumpPoints];[self refreshJumpMenus];
+}
+- (void)jumpToPoint:(NSMenuItem *)sender {
+    if(self.pdf.document)[self.events addObject:@{@"kind":@5,@"jumpID":sender.representedObject}];
+}
+- (void)removeJumpPoint:(NSMenuItem *)sender {
+    NSIndexSet *indices=[self.jumpPoints indexesOfObjectsPassingTest:^BOOL(NSDictionary *p,NSUInteger i,BOOL *stop){return [p[@"id"] isEqual:sender.representedObject];}];
+    if(indices.count){[self.jumpPoints removeObjectsAtIndexes:indices];self.status.stringValue=@"Jump point removed";[self saveJumpPoints];[self refreshJumpMenus];}
+}
+- (BOOL)prepareJump:(NSInteger)index navigate:(BOOL)navigate {
+    self.matchingJump=nil;
+    if(!self.pdf.document||index<0||index>=self.jumpPoints.count)return NO;
+    self.matchingJump=self.jumpPoints[index];self.jumpShouldNavigate=navigate;self.anchors=self.matchingJump[@"anchors"];return YES;
+}
+- (NSArray *)matchLines {return self.matchingJump?self.lines:self.candidateLines;}
+- (NSInteger)finishMatch:(NSInteger)index anchor:(NSInteger)anchor {
+    if(!self.matchingJump){[self commitLine:index anchor:anchor];return 0;}
+    NSMutableDictionary *point=self.matchingJump;NSDictionary *before=[point copy];
+    BOOL matched=index>=0&&index<self.lines.count;
+    NSPoint offset=NSPointFromString(point[@"offset"]),destination=NSPointFromString(point[@"point"]);NSInteger page=[point[@"page"] integerValue];
+    if(matched){
+        NSDictionary *line=self.lines[index];page=[line[@"page"] integerValue];destination=NSRectFromString(line[@"rect"]).origin;
+        offset=NSPointFromString(self.anchors[MAX(0,MIN(anchor,2))][@"offset"]);
+        NSMutableArray *anchors=[NSMutableArray new];CGFloat scale=[point[@"scale"] doubleValue];
+        for(NSInteger j=0;j<3;j++){NSInteger i=index+(j==1?-1:j==2?1:0);
+            if(i<0||i>=self.lines.count||[self.lines[i][@"page"] integerValue]!=page){[anchors addObject:@{@"text":@"",@"page":@(page),@"offset":NSStringFromPoint(offset)}];continue;}
+            NSMutableDictionary *a=[self.lines[i] mutableCopy];NSPoint pos=NSRectFromString(a[@"rect"]).origin;
+            a[@"offset"]=NSStringFromPoint(NSMakePoint(offset.x+(pos.x-destination.x)*scale,offset.y+(pos.y-destination.y)*scale));[anchors addObject:a];
+        }
+        point[@"anchors"]=anchors;point[@"page"]=@(page);point[@"point"]=NSStringFromPoint(destination);point[@"offset"]=NSStringFromPoint(offset);
+    }
+    if(self.jumpShouldNavigate){
+        offset.x*=self.pdf.bounds.size.width/[point[@"width"] doubleValue];offset.y*=self.pdf.bounds.size.height/[point[@"height"] doubleValue];
+        [self positionPage:page point:destination offset:offset];[self pageChanged:nil];
+        self.status.stringValue=[NSString stringWithFormat:@"Jumped to %@%@",point[@"name"],matched?@"":@" · approximate location"];
+    }
+    self.matchingJump=nil;
+    if(![before isEqual:point]){[self saveJumpPoints];[self refreshJumpMenus];}return 0;
 }
 - (void)navigationRequest:(NSNotification *)note {
     NSDictionary *r=note.userInfo;if(![r[@"pdf"] isEqual:self.path])return;
@@ -248,17 +393,26 @@ static Viewer *V;
         if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateDigest=self.event[@"digest"];}
         return self.event[@"kind"];
     }}
-    if([op isEqual:@"number"]){NSString *k=a[0];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @(self.candidateLines.count);if([k isEqual:@"same"])return @([self.digest isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
-    if([op isEqual:@"text"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.candidateLines.count?self.candidateLines[i][@"text"]:@"";}
+    if([op isEqual:@"number"]){NSString *k=a[0];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"same"])return @([self.digest isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
+    if([op isEqual:@"text"]){NSInteger i=[a[0] integerValue];NSArray *lines=[self matchLines];return i>=0&&i<lines.count?lines[i][@"text"]:@"";}
     if([op isEqual:@"oldtext"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.lines.count?self.lines[i][@"text"]:@"";}
     if([op isEqual:@"anchor"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"text"]:@"";}
-    if([op isEqual:@"pageof"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.candidateLines.count?self.candidateLines[i][@"page"]:@0;}
+    if([op isEqual:@"pageof"]){NSInteger i=[a[0] integerValue];NSArray *lines=[self matchLines];return i>=0&&i<lines.count?lines[i][@"page"]:@0;}
     if([op isEqual:@"anchorpage"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"page"]:@0;}
     if([op isEqual:@"begin"]){[self begin:[a[0] integerValue]];return @0;}
     if([op isEqual:@"prepare"]){[self capture];return @0;}
     if([op isEqual:@"unchanged"]){self.status.stringValue=[NSString stringWithFormat:@"Up to date · %@",self.path?:@""];self.candidate=nil;[self navigate];return @0;}
     if([op isEqual:@"navigate"]){self.navigationSource=a[0];self.navigationLine=[a[1] integerValue];self.navigationSerial++;[self reload:nil];return @0;}
     if([op isEqual:@"commit"]){[self commitLine:[a[0] integerValue] anchor:[a[1] integerValue]];return @0;}
+    if([op isEqual:@"finishMatch"])return @([self finishMatch:[a[0] integerValue] anchor:[a[1] integerValue]]);
+    if([op isEqual:@"jumpName"])return self.event[@"name"]?:@"";
+    if([op isEqual:@"jumpNameExists"]){for(NSDictionary *p in self.jumpPoints)if([p[@"name"] isEqual:a[0]])return @1;return @0;}
+    if([op isEqual:@"saveJump"]){[self addJumpPointNamed:a[0]];return @0;}
+    if([op isEqual:@"prepareJump"])return @([self prepareJump:[a[0] integerValue] navigate:NO]);
+    if([op isEqual:@"prepareSelectedJump"]){NSUInteger i=[self.jumpPoints indexOfObjectPassingTest:^BOOL(NSDictionary *p,NSUInteger i,BOOL *stop){return [p[@"id"] isEqual:self.event[@"jumpID"]];}];return @([self prepareJump:i==NSNotFound?-1:(NSInteger)i navigate:YES]);}
+    if([op isEqual:@"addJump"]){if(self.pdf.document)[self queueJumpName:a[0] snapshot:[self jumpSnapshot]];return @0;}
+    if([op isEqual:@"jump"]||[op isEqual:@"removeJump"]){NSMenuItem *item=[NSMenuItem new];item.representedObject=a[0];if([op isEqual:@"jump"])[self jumpToPoint:item];else [self removeJumpPoint:item];return @0;}
+    if([op isEqual:@"inspectJumps"])return self.jumpPoints?:@[];
     if([op isEqual:@"status"]){self.status.stringValue=[NSString stringWithFormat:@"%@ · %@",a[0],self.path?:@""];return @0;}
     if([op isEqual:@"open"]){[self openPath:a[0]];return @0;}
     if([op isEqual:@"close"]){[self closeDocument:nil];return @0;}
