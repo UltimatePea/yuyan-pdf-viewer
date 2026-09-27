@@ -33,6 +33,13 @@ static Viewer *V;
 @property NSSearchField *search;
 @property NSString *path,*digest;
 @property NSDate *lastUpdated;
+@property NSMutableDictionary<NSString *,NSMutableArray *> *histories;
+@property NSMutableArray *history;
+@property NSInteger versionIndex,candidateVersionIndex;
+@property NSData *candidateData;
+@property NSDate *candidateTime;
+@property NSMenu *versionsMenu;
+@property NSButton *previousVersionButton,*nextVersionButton,*latestVersionButton;
 @property NSArray *lines,*candidateLines,*anchors;
 @property PDFDocument *candidate;
 @property NSString *candidateDigest;
@@ -75,6 +82,7 @@ static Viewer *V;
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action key:(NSString *)key menu:(NSMenu *)menu {NSMenuItem *i=[menu addItemWithTitle:title action:action keyEquivalent:key];i.target=self;return i;}
 - (void)setup {
     self.events=[NSMutableArray new]; self.lines=@[];self.anchors=@[];self.fit=YES;
+    self.histories=[NSMutableDictionary new];self.versionIndex=-1;
     self.readQueue=dispatch_queue_create("org.yuyan.reader.pdf",DISPATCH_QUEUE_SERIAL);
     [NSApplication sharedApplication]; NSApp.delegate=self; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     NSMenu *bar=[NSMenu new]; NSApp.mainMenu=bar;
@@ -102,6 +110,7 @@ static Viewer *V;
     self.jumpPoints=[NSMutableArray new];
     self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
     [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
+    self.versionsMenu=[[NSMenu alloc]initWithTitle:@"Versions"];[bar addItemWithTitle:@"Versions" action:nil keyEquivalent:@""].submenu=self.versionsMenu;
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(180,100,980,820) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
     self.window.title=@"阅卷 — PDF";self.window.delegate=self; self.window.releasedWhenClosed=NO;
     self.window.minSize=NSMakeSize(760,420);
@@ -116,9 +125,13 @@ static Viewer *V;
     self.pageField=[[NSTextField alloc]initWithFrame:NSMakeRect(x+5,784,48,24)];self.pageField.placeholderString=@"Page";self.pageField.target=self;self.pageField.action=@selector(page:);self.pageField.autoresizingMask=NSViewMinYMargin;[root addSubview:self.pageField];
     self.setJumpButton=[NSButton buttonWithTitle:@"Set Point" target:self action:@selector(quickSetJumpPoint:)];self.setJumpButton.frame=NSMakeRect(350,782,82,28);self.setJumpButton.autoresizingMask=NSViewMinYMargin;self.setJumpButton.toolTip=@"Set jump point (⌘D). Set a named point with ⇧⌘D or right-click.";[root addSubview:self.setJumpButton];
     self.setJumpButton.menu=[NSMenu new];[self item:@"Set Named Jump Point…" action:@selector(setJumpPoint:) key:@"" menu:self.setJumpButton.menu];
+    self.previousVersionButton=[NSButton buttonWithTitle:@"‹" target:self action:@selector(previousVersion:)];self.previousVersionButton.toolTip=@"Previous PDF version (⌥⌘[)";[self.previousVersionButton setAccessibilityLabel:@"Previous PDF version"];
+    self.latestVersionButton=[NSButton buttonWithTitle:@"v1/1" target:self action:@selector(latestVersion:)];self.latestVersionButton.toolTip=@"Return to latest PDF version (⌥⌘0)";
+    self.nextVersionButton=[NSButton buttonWithTitle:@"›" target:self action:@selector(nextVersion:)];self.nextVersionButton.toolTip=@"Next PDF version (⌥⌘])";[self.nextVersionButton setAccessibilityLabel:@"Next PDF version"];
+    for(NSButton *button in @[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]){button.font=[NSFont systemFontOfSize:11];[root addSubview:button];}
     self.jumpBar=[[NSScrollView alloc]initWithFrame:NSMakeRect(440,782,0,28)];self.jumpBar.autoresizingMask=NSViewMinYMargin;self.jumpBar.hasHorizontalScroller=YES;self.jumpBar.scrollerStyle=NSScrollerStyleOverlay;self.jumpBar.autohidesScrollers=YES;self.jumpBar.drawsBackground=NO;[root addSubview:self.jumpBar];[self refreshJumpMenus];
     self.search=[[NSSearchField alloc]initWithFrame:NSMakeRect(650,784,315,24)];self.search.placeholderString=@"Find in PDF";self.search.target=self;self.search.action=@selector(search:);self.search.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;[root addSubview:self.search];
-    [self layoutJumpControls];
+    [self refreshVersionControls];[self layoutJumpControls];
     self.status=[NSTextField labelWithString:@"Open a PDF to begin"];self.status.frame=NSMakeRect(12,6,956,18);self.status.autoresizingMask=NSViewWidthSizable;self.status.lineBreakMode=NSLineBreakByTruncatingMiddle;[root addSubview:self.status];
     [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(pageChanged:) name:PDFViewPageChangedNotification object:self.pdf];
     [[NSDistributedNotificationCenter defaultCenter]addObserver:self selector:@selector(navigationRequest:) name:@"org.yuyan.reader.navigate" object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
@@ -155,15 +168,18 @@ static Viewer *V;
     dispatch_source_set_event_handler(self.fileWatch,^{if(session==self.session){[self armFileWatch];if(![self.events.lastObject[@"kind"] isEqual:@2])[self enqueue:2 generation:0];}});
     dispatch_source_set_cancel_handler(self.fileWatch,^{close(fd);});dispatch_resume(self.fileWatch);self.watchCount++;
 }
-- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.pdf.document=nil;self.lines=@[];self.candidate=nil;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
+- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.pdf.document=nil;self.lines=@[];[self clearCandidate];self.history=nil;self.versionIndex=-1;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self refreshVersionControls];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
 - (void)openPath:(NSString *)path {
     [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;self.lastUpdated=nil;
-    self.pdf.document=nil;self.lines=@[];self.candidate=nil;[self.events removeAllObjects];
+    self.pdf.document=nil;self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
+    self.history=self.histories[self.path];if(!self.history){self.history=[NSMutableArray new];self.histories[self.path]=self.history;}self.versionIndex=-1;
     self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
     self.status.stringValue=[@"Opening · " stringByAppendingString:self.path];
     self.fileSignature=nil;[self armDirectoryWatch];
     [self armFileWatch];
+    if(self.history.count){[self prepareVersion:(NSInteger)self.history.count-1];[self capture];[self commitLine:-1 anchor:0];}
+    [self refreshVersionControls];
     [self enqueue:1 generation:0];
 }
 - (void)reload:(id)sender {if(self.path)[self enqueue:2 generation:0];}
@@ -194,7 +210,7 @@ static Viewer *V;
         }
         if(delay>0)[NSThread sleepForTimeInterval:delay];
         dispatch_async(dispatch_get_main_queue(),^{if(session!=self.session)return;
-            if(doc){[self.events addObject:@{@"kind":@3,@"generation":@(generation),@"doc":doc,@"lines":lines,@"digest":hash}];}
+            if(doc){[self.events addObject:@{@"kind":@3,@"generation":@(generation),@"doc":doc,@"lines":lines,@"digest":hash,@"data":data}];}
             else [self enqueue:4 generation:generation];
         });
     }});
@@ -222,19 +238,54 @@ static Viewer *V;
     NSView *dv=self.pdf.documentView;NSClipView *clip=(NSClipView *)dv.superview;
     if([clip isKindOfClass:NSClipView.class]){NSPoint actual=[self.pdf convertPoint:point fromPage:p];NSPoint a=[dv convertPoint:actual fromView:self.pdf];NSPoint b=[dv convertPoint:offset fromView:self.pdf];NSPoint origin=clip.bounds.origin;origin.x+=a.x-b.x;origin.y+=a.y-b.y;[clip scrollToPoint:[clip constrainBoundsRect:(NSRect){origin,clip.bounds.size}].origin];[(NSScrollView *)clip.superview reflectScrolledClipView:clip];}
 }
-- (NSString *)updatedStatus {
+- (NSString *)dateText:(NSDate *)date {
     // 文言：记成卷之时，精确至秒；无变则不改其时。汉语：使用系统当地时间，保留最后成功更新的时间戳。
     NSDateFormatter *format=[NSDateFormatter new];format.locale=[[NSLocale alloc]initWithLocaleIdentifier:@"en_US_POSIX"];format.calendar=[[NSCalendar alloc]initWithCalendarIdentifier:NSCalendarIdentifierGregorian];format.timeZone=NSTimeZone.localTimeZone;format.dateFormat=@"yyyy-MM-dd HH:mm:ss";
-    return [NSString stringWithFormat:@"Updated at %@ · %lu pages · %@",self.lastUpdated?[format stringFromDate:self.lastUpdated]:@"—",self.pdf.document.pageCount,self.path?:@""];
+    return date?[format stringFromDate:date]:@"—";
+}
+- (NSString *)updatedStatus {
+    NSString *prefix=self.versionIndex<(NSInteger)self.history.count-1?[NSString stringWithFormat:@"Viewing version %ld/%lu · ",(long)self.versionIndex+1,self.history.count]:@"";
+    NSString *version=prefix.length?@"":[NSString stringWithFormat:@" · Version %ld/%lu",(long)self.versionIndex+1,self.history.count];
+    return [NSString stringWithFormat:@"%@Updated at %@%@ · %lu pages · %@",prefix,[self dateText:self.lastUpdated],version,self.pdf.document.pageCount,self.path?:@""];
 }
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
     if(!self.candidate)return;
-    BOOL initial=self.pdf.document==nil;self.pdf.document=self.candidate;self.lines=self.candidateLines;self.digest=self.candidateDigest;self.candidate=nil;self.commits++;
+    BOOL initial=self.pdf.document==nil;self.pdf.document=self.candidate;self.lines=self.candidateLines;self.digest=self.candidateDigest;self.lastUpdated=self.candidateTime;self.versionIndex=self.candidateVersionIndex;[self clearCandidate];self.commits++;
     self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
     if(!initial){if(line>=0&&line<self.lines.count){NSDictionary *l=self.lines[line];NSPoint off=anchor>=0&&anchor<self.anchors.count?NSPointFromString(self.anchors[anchor][@"offset"]):self.fallbackOffset;[self positionPage:[l[@"page"] integerValue] point:NSRectFromString(l[@"rect"]).origin offset:off];}else [self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
-    self.lastUpdated=[NSDate date];self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
-    [self refreshJumpMenus];
+    self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
+    [self refreshJumpMenus];[self refreshVersionControls];
     [self navigate];
+}
+
+// 文言：诸成卷皆藏内存，换览不覆原卷。汉语：保留每次成功加载的内容变更；不淘汰旧快照，不写回 PDF。
+- (void)clearCandidate {self.candidate=nil;self.candidateLines=nil;self.candidateDigest=nil;self.candidateData=nil;self.candidateTime=nil;self.candidateVersionIndex=-1;}
+- (void)recordVersion {
+    if(!self.candidate||!self.candidateData)return;
+    self.candidateTime=[NSDate date];self.candidateVersionIndex=self.history.count;
+    [self.history addObject:@{@"doc":self.candidate,@"lines":self.candidateLines,@"digest":self.candidateDigest,@"time":self.candidateTime,@"data":self.candidateData}];
+}
+- (void)retainHistoricalView {[self clearCandidate];self.status.stringValue=[self updatedStatus];[self refreshVersionControls];[self navigate];}
+- (BOOL)prepareVersion:(NSInteger)index {
+    if(index<0||index>=self.history.count||index==self.versionIndex)return NO;
+    NSDictionary *snapshot=self.history[index];self.candidate=snapshot[@"doc"];self.candidateLines=snapshot[@"lines"];self.candidateDigest=snapshot[@"digest"];self.candidateData=snapshot[@"data"];self.candidateTime=snapshot[@"time"];self.candidateVersionIndex=index;return YES;
+}
+- (void)previousVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@(-1)}];}
+- (void)nextVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@1}];}
+- (void)latestVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@0}];}
+- (void)selectVersion:(NSMenuItem *)sender {[self.events addObject:@{@"kind":@7,@"historyIndex":sender.representedObject}];}
+- (void)refreshVersionControls {
+    BOOL previous=self.versionIndex>0,next=self.versionIndex>=0&&self.versionIndex<(NSInteger)self.history.count-1;
+    self.previousVersionButton.enabled=previous;self.nextVersionButton.enabled=next;self.latestVersionButton.enabled=next;
+    self.latestVersionButton.title=[NSString stringWithFormat:@"v%ld/%lu",MAX(0,(long)self.versionIndex+1),self.history.count];
+    [self.versionsMenu removeAllItems];self.versionsMenu.autoenablesItems=NO;
+    NSArray *titles=@[@"Previous Version",@"Next Version",@"Latest Version"],*keys=@[@"[",@"]",@"0"];
+    SEL actions[]={@selector(previousVersion:),@selector(nextVersion:),@selector(latestVersion:)};
+    for(int i=0;i<3;i++){NSMenuItem *item=[self item:titles[i] action:actions[i] key:keys[i] menu:self.versionsMenu];item.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagOption;item.enabled=i==0?previous:next;}
+    [self.versionsMenu addItem:NSMenuItem.separatorItem];
+    for(NSInteger i=(NSInteger)self.history.count-1;i>=0;i--){NSString *title=[NSString stringWithFormat:@"Version %ld — %@%@",(long)i+1,[self dateText:self.history[i][@"time"]],i==(NSInteger)self.history.count-1?@" (Latest)":@""];
+        NSMenuItem *item=[self item:title action:@selector(selectVersion:) key:@"" menu:self.versionsMenu];item.representedObject=@(i);item.state=i==self.versionIndex?NSControlStateValueOn:NSControlStateValueOff;}
+    [self layoutJumpControls];
 }
 
 // 文言：跳点存于私库，不改原卷；寻锚之策仍归豫言。汉语：持久化与菜单适配，不在此实现文本匹配算法。
@@ -304,10 +355,13 @@ static Viewer *V;
 }
 - (void)layoutJumpControls {
     if(!self.jumpBar)return;
-    NSSize size=self.window.contentView.bounds.size;CGFloat available=MAX(0,size.width-452);
+    NSSize size=self.window.contentView.bounds.size;BOOL showHistory=self.history.count>1;
+    self.previousVersionButton.hidden=!showHistory;self.latestVersionButton.hidden=!showHistory;self.nextVersionButton.hidden=!showHistory;
+    self.previousVersionButton.frame=NSMakeRect(440,size.height-38,22,28);self.latestVersionButton.frame=NSMakeRect(464,size.height-38,54,28);self.nextVersionButton.frame=NSMakeRect(520,size.height-38,22,28);
+    CGFloat start=showHistory?550:440;CGFloat available=MAX(0,size.width-start-12);
     CGFloat width=self.jumpPoints.count?MIN(self.jumpContentWidth,MAX(0,available-168)):0;
-    self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(440,size.height-38,width,28);
-    CGFloat searchX=440+width+(self.jumpPoints.count?8:0);self.search.frame=NSMakeRect(searchX,size.height-36,MAX(0,size.width-searchX-12),24);
+    self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(start,size.height-38,width,28);
+    CGFloat searchX=start+width+(self.jumpPoints.count?8:0);self.search.frame=NSMakeRect(searchX,size.height-36,MAX(0,size.width-searchX-12),24);
 }
 - (void)jumpButton:(NSButton *)sender {NSMenuItem *item=[NSMenuItem new];item.representedObject=sender.identifier;[self jumpToPoint:item];}
 - (void)quickSetJumpPoint:(id)sender {if(self.pdf.document)[self queueJumpName:@"" snapshot:[self jumpSnapshot]];}
@@ -343,7 +397,8 @@ static Viewer *V;
 - (NSArray *)matchLines {return self.matchingJump?self.lines:self.candidateLines;}
 - (NSInteger)finishMatch:(NSInteger)index anchor:(NSInteger)anchor {
     if(!self.matchingJump){[self commitLine:index anchor:anchor];return 0;}
-    NSMutableDictionary *point=self.matchingJump;NSDictionary *before=[point copy];
+    BOOL historical=self.versionIndex<(NSInteger)self.history.count-1;
+    NSMutableDictionary *point=historical?[self.matchingJump mutableCopy]:self.matchingJump;NSDictionary *before=[point copy];
     BOOL matched=index>=0&&index<self.lines.count;
     NSPoint offset=NSPointFromString(point[@"offset"]),destination=NSPointFromString(point[@"point"]);NSInteger page=[point[@"page"] integerValue];
     if(matched){
@@ -363,7 +418,7 @@ static Viewer *V;
         self.status.stringValue=[NSString stringWithFormat:@"Jumped to %@%@",point[@"name"],matched?@"":@" · approximate location"];
     }
     self.matchingJump=nil;
-    if(![before isEqual:point]){[self saveJumpPoints];[self refreshJumpMenus];}return 0;
+    if(!historical&&![before isEqual:point]){[self saveJumpPoints];[self refreshJumpMenus];}return 0;
 }
 - (void)navigationRequest:(NSNotification *)note {
     NSDictionary *r=note.userInfo;if(![r[@"pdf"] isEqual:self.path])return;
@@ -371,6 +426,7 @@ static Viewer *V;
 }
 - (void)navigate {
     if(!self.navigationSource.length||!self.pdf.document)return;
+    if(self.versionIndex<(NSInteger)self.history.count-1){[self latestVersion:nil];return;}
     NSString *source=self.navigationSource,*path=self.path,*hash=self.digest;NSInteger line=self.navigationLine;NSUInteger serial=self.navigationSerial;
     self.navigationSource=nil;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{@autoreleasepool {
@@ -396,10 +452,10 @@ static Viewer *V;
             if(self.fileSignature&&![self.fileSignature isEqual:signature])[self enqueue:2 generation:0];self.fileSignature=signature;
         }
         if(!self.events.count)return @0;self.event=self.events[0];[self.events removeObjectAtIndex:0];
-        if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateDigest=self.event[@"digest"];}
+        if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateDigest=self.event[@"digest"];self.candidateData=self.event[@"data"];self.candidateTime=nil;self.candidateVersionIndex=-1;}
         return self.event[@"kind"];
     }}
-    if([op isEqual:@"number"]){NSString *k=a[0];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"same"])return @([self.digest isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
+    if([op isEqual:@"number"]){NSString *k=a[0];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"versions"])return @(self.history.count);if([k isEqual:@"versionIndex"])return @(self.versionIndex);if([k isEqual:@"same"])return @([self.history.lastObject[@"digest"] isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
     if([op isEqual:@"text"]){NSInteger i=[a[0] integerValue];NSArray *lines=[self matchLines];return i>=0&&i<lines.count?lines[i][@"text"]:@"";}
     if([op isEqual:@"oldtext"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.lines.count?self.lines[i][@"text"]:@"";}
     if([op isEqual:@"anchor"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"text"]:@"";}
@@ -407,7 +463,13 @@ static Viewer *V;
     if([op isEqual:@"anchorpage"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"page"]:@0;}
     if([op isEqual:@"begin"]){[self begin:[a[0] integerValue]];return @0;}
     if([op isEqual:@"prepare"]){[self capture];return @0;}
-    if([op isEqual:@"unchanged"]){self.status.stringValue=[self updatedStatus];self.candidate=nil;[self navigate];return @0;}
+    if([op isEqual:@"unchanged"]){self.status.stringValue=[self updatedStatus];[self clearCandidate];[self navigate];return @0;}
+    if([op isEqual:@"recordVersion"]){[self recordVersion];return @0;}
+    if([op isEqual:@"retainHistoricalView"]){[self retainHistoricalView];return @0;}
+    if([op isEqual:@"prepareHistory"]){NSInteger index=self.event[@"historyIndex"]?[self.event[@"historyIndex"] integerValue]:[self.event[@"historyStep"] integerValue]==0?(NSInteger)self.history.count-1:self.versionIndex+[self.event[@"historyStep"] integerValue];return @([self prepareVersion:index]);}
+    if([op isEqual:@"history"]){[self.events addObject:@{@"kind":@7,@"historyIndex":a[0]}];return @0;}
+    if([op isEqual:@"historyStep"]){[self.events addObject:@{@"kind":@7,@"historyStep":a[0]}];return @0;}
+    if([op isEqual:@"inspectVersions"]){NSMutableArray *list=[NSMutableArray new];for(NSDictionary *s in self.history)[list addObject:@{@"digest":s[@"digest"],@"time":@([s[@"time"] timeIntervalSince1970]*1000),@"bytes":@([s[@"data"] length]),@"pages":@([s[@"doc"] pageCount])}];return list;}
     if([op isEqual:@"navigate"]){self.navigationSource=a[0];self.navigationLine=[a[1] integerValue];self.navigationSerial++;[self reload:nil];return @0;}
     if([op isEqual:@"commit"]){[self commitLine:[a[0] integerValue] anchor:[a[1] integerValue]];return @0;}
     if([op isEqual:@"finishMatch"])return @([self finishMatch:[a[0] integerValue] anchor:[a[1] integerValue]]);
@@ -427,7 +489,7 @@ static Viewer *V;
     if([op isEqual:@"testDelay"]){self.testDelay=[a[0] doubleValue];return @0;}
     if([op isEqual:@"testFollow"]){self.follow=[a[0] boolValue];return @0;}
     if([op isEqual:@"testMode"]){[self setModePreservingPosition:[a[0] integerValue]];return @0;}
-    if([op isEqual:@"inspect"]){[self capture];return @{@"path":self.path?:@"",@"commits":@(self.commits),@"loads":@(self.loads),@"watchers":@(self.watchCount),@"pages":@(self.pdf.document.pageCount),@"page":@(self.fallbackPage),@"mode":@(self.pdf.displayMode),@"zoom":@(self.pdf.scaleFactor),@"anchor":self.anchors.count?self.anchors[0]:@{},@"digest":self.digest?:@"",@"lastUpdatedMs":@(self.lastUpdated.timeIntervalSince1970*1000),@"status":self.status.stringValue?:@""};}
+    if([op isEqual:@"inspect"]){[self capture];return @{@"path":self.path?:@"",@"commits":@(self.commits),@"loads":@(self.loads),@"watchers":@(self.watchCount),@"pages":@(self.pdf.document.pageCount),@"page":@(self.fallbackPage),@"mode":@(self.pdf.displayMode),@"zoom":@(self.pdf.scaleFactor),@"anchor":self.anchors.count?self.anchors[0]:@{},@"digest":self.digest?:@"",@"lastUpdatedMs":@(self.lastUpdated.timeIntervalSince1970*1000),@"versionIndex":@(self.versionIndex),@"versionCount":@(self.history.count),@"status":self.status.stringValue?:@""};}
     return @0;
 }
 @end

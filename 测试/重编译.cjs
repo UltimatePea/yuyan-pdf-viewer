@@ -13,9 +13,11 @@ function* scenario(){
  build(source(true));yield* wait(()=>state().pages===5,'latexmk insertion');let after=state();check(after.anchor.text===before.anchor.text,'latexmk page insertion preserves text');check(after.anchor.page===before.anchor.page+1,'latexmk anchor follows page insertion');check(Math.abs(after.zoom-before.zoom)<.001,'latexmk preserves zoom');
  let c=after.commits;build(source(false,true));yield* wait(()=>state().commits>c,'latexmk deletion and edit');check(state().anchor.page===2,'latexmk deletion and paragraph edit preserve region');
  const line=fs.readFileSync(tex,'utf8').split('\n').findIndex(s=>s.includes('Delta paragraph 4:'))+1;
+ api('history',[0]);yield* wait(()=>state().versionIndex===0,'browse history before SyncTeX');
  // Request through the actual separate-process command-line interface.
  const command=cp.spawnSync(path.resolve(__dirname,'../运行.sh'),['--navigate',pdf,tex,String(line)],{encoding:'utf8'});assert.equal(command.status,0,command.stderr);
  yield* wait(()=>state().status.startsWith('SyncTeX ·'),'CLI SyncTeX navigation');check(state().page===3,'CLI source line navigates to correct PDF page');
+ check(state().versionIndex===state().versionCount-1,'explicit SyncTeX navigation returns to the latest version');
  fs.unlinkSync(path.join(dir,'paper.synctex.gz'));api('navigate',[tex,line]);yield* wait(()=>state().status.includes('unavailable'),'missing synctex');check(state().pages===4,'missing SyncTeX never prevents viewing');
  api('quit');console.log(JSON.stringify({passed:checks,directory:dir}));
 }

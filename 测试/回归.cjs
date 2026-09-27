@@ -29,10 +29,11 @@ function* scenario(){
  c=state().commits;const digest=state().digest;fs.unlinkSync(file);yield* delay(450);check(state().digest===digest&&state().pages===4,'delete keeps last valid document');fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'recreated'}));yield* wait(()=>state().commits>c,'recreate');check(state().watchers===2,'file watcher rearmed after recreation');
  c=state().commits;const before=state().digest,lastGoodTime=state().lastUpdatedMs;fs.writeFileSync(file,'%PDF-1.4\npartial');yield* delay(450);check(state().digest===before,'partial write keeps last valid PDF');check(state().lastUpdatedMs===lastGoodTime,'failed reload preserves the last successful update time');fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'complete'}));yield* wait(()=>state().commits>c,'complete after partial');check(true,'invalid-to-valid retry succeeds');
  c=state().commits;for(let i=0;i<12;i++)fs.writeFileSync(file,pdf(['Alpha','Beta','Gamma','Delta'],{revision:'burst '+i}));yield* wait(()=>state().commits>c,'rapid builds');yield* delay(600);check(state().commits===c+1,'rapid burst coalesces into one commit');
- api('testDelay',[.65]);c=state().commits;let loads=state().loads;
+ api('testDelay',[.65]);c=state().commits;let loads=state().loads,versionCount=state().versionCount;
  fs.writeFileSync(file,pdf(['Old async result'],{revision:'old'}));yield* wait(()=>state().loads>loads,'asynchronous read started');yield* delay(100);
  const latest=pdf(['Alpha','Beta','Gamma','Delta'],{revision:'latest wins'});fs.writeFileSync(file,latest);
  yield* wait(()=>state().commits>c,'latest async read');check(state().pages===4,'stale asynchronous result cannot replace the current PDF');
+ check(state().versionCount===versionCount+1,'stale asynchronous result is excluded from version history');
  check(state().digest===require('node:crypto').createHash('sha256').update(latest).digest('hex'),'latest bytes are rendered');api('testDelay',[0]);
  // Change the visible line, retaining its neighboring passage.
  console.log('BEFOREMODE',state());api('testMode',[0]);console.log('AFTERMODE',state());
