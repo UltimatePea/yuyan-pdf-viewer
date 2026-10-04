@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.6 — 2026-10-04
+
+- Let history and jump points overflow to a second toolbar row when the window is too narrow to keep every control readable. Return to one row automatically when there is enough room.
+- Give checkpoint buttons their full native height and remove the scrollbar reservation that clipped their labels on macOS 27. Additional points remain reachable by horizontal scrolling.
+- Keep search and its navigation buttons on the first row with a readable field width, and resize the PDF area below the toolbar to prevent overlap.
+
 ## v0.2.5 — 2026-10-04
 
 - Fix a crash while opening certain LaTeX PDFs on macOS 27. PDFKit can return a negative line-range length encoded as a huge unsigned value; reading that selection's text causes a fatal CoreFoundation trap.

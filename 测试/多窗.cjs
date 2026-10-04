@@ -23,7 +23,7 @@ function* scenario(){
  const after=call(one,'inspectJumps')[0];
  check(after.name==='Conclusion 结论','rename trims whitespace and supports Unicode');
  const ui=call(one,'inspectUI');check(ui.buttons[0].title===after.name&&ui.buttons[0].actions.includes('Rename…'),'toolbar label updates and exposes Rename in its context menu');
- check(ui.pointY===ui.setY&&ui.historyY===ui.setY&&Math.abs(ui.searchY-ui.setY)<=2,'jump points and history controls remain on a single toolbar row');
+ check(ui.pointY+4===ui.setY&&ui.historyY===ui.setY&&Math.abs(ui.searchY-ui.setY)<=4,'jump points and history controls remain on a single toolbar row');
  check(!ui.active&&!ui.visible&&!ui.canBecomeKey&&!ui.canBecomeMain,'background test windows are hidden and cannot take focus');
  check(JSON.stringify({...after,name:before.name})===JSON.stringify(before),'rename preserves stable ID, location, anchors, and ordering');
  check(!call(one,'renameJump',[before.id,' \n ']),'blank rename leaves the saved name intact');

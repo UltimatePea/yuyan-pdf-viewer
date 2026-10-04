@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.5-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.6-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -33,7 +33,7 @@ Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content
 
 ## Version history
 
-Every successfully loaded content change is retained as an immutable PDF snapshot **in memory**, with its original update timestamp. After the first refresh, compact **‹ vN/Total ›** controls appear in the same toolbar row: the arrows move between versions, and clicking the version counter returns to Latest. The **Versions** menu lists every snapshot by number and timestamp.
+Every successfully loaded content change is retained as an immutable PDF snapshot **in memory**, with its original update timestamp. After the first refresh, compact **‹ vN/Total ›** controls appear in the toolbar: the arrows move between versions, and clicking the version counter returns to Latest. The **Versions** menu lists every snapshot by number and timestamp.
 
 - **⌥⌘[**: previous version; **⌥⌘]**: next version; **⌥⌘0**: latest version.
 - While viewing an older version, new successful refreshes are collected without replacing what you are reading. Returning to Latest resumes live updates.
@@ -47,7 +47,7 @@ Explicit SyncTeX navigation returns to Latest, because the source and SyncTeX fi
 
 Press **⌘D** or click **Set Point** to save the current reading location instantly. Unnamed points use **A, B, … Z, AA, AB…**, skipping labels already in use. Press **⇧⌘D** or right-click **Set Point** to supply a custom name.
 
-Everything stays on a **single compact toolbar row**, including when no points exist. Saved points appear as small named buttons beside Set Point: click one to jump, or use **⌘1–⌘9** for the first nine points in display order. Right-click a point for **Jump to Point**, **Rename…** and **Remove Jump Point**; renaming and removal has no shortcut or extra toolbar button. The Jump Points menu also exposes these actions. Scroll the inline point area horizontally when it fills up; it never wraps to another row.
+The toolbar uses **one row when everything fits**. When space is tight, history and saved points move to a **second row**, keeping labels and search readable. Saved points appear as small named buttons beside Set Point: click one to jump, or use **⌘1–⌘9** for the first nine points in display order. Right-click a point for **Jump to Point**, **Rename…** and **Remove Jump Point**; renaming and removal has no shortcut or extra toolbar button. The Jump Points menu also exposes these actions. Scroll the inline point area horizontally when it fills up; it remains horizontally scrollable even in the overflow row.
 
 Renaming changes only the label: the saved location, button order and jump shortcut stay the same. Names may contain Unicode; an empty rename keeps the existing name.
 

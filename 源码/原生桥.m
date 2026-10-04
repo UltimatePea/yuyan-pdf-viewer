@@ -87,6 +87,8 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 @property NSMutableArray<NSMutableDictionary *> *jumpPoints;
 @property NSMenu *jumpMenu;
 @property NSButton *setJumpButton;
+@property NSArray<NSButton *> *baseButtons;
+@property BOOL toolbarOverflow;
 @property NSScrollView *jumpBar;
 @property CGFloat jumpContentWidth;
 @property NSMutableDictionary *matchingJump;
@@ -150,7 +152,8 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     CGFloat x=12;
     NSArray *titles=@[@"Open…",@"‹",@"›",@"−",@"+",@"Fit Width"];
     SEL actions[]={@selector(open:),@selector(previous:),@selector(next:),@selector(zoomOut:),@selector(zoomIn:),@selector(fitWidth:)};
-    for(int i=0;i<titles.count;i++){NSButton *b=[NSButton buttonWithTitle:titles[i] target:self action:actions[i]];b.frame=NSMakeRect(x,782,i==0?64:i==5?68:30,28);b.autoresizingMask=NSViewMinYMargin;[root addSubview:b];x+=b.frame.size.width+4;}
+    NSMutableArray *baseButtons=[NSMutableArray new];
+    for(int i=0;i<titles.count;i++){NSButton *b=[NSButton buttonWithTitle:titles[i] target:self action:actions[i]];b.frame=NSMakeRect(x,782,i==0?64:i==5?68:30,28);b.autoresizingMask=NSViewMinYMargin;[root addSubview:b];[baseButtons addObject:b];x+=b.frame.size.width+4;}self.baseButtons=baseButtons;
     self.pageField=[[NSTextField alloc]initWithFrame:NSMakeRect(x+5,784,48,24)];self.pageField.placeholderString=@"Page";self.pageField.target=self;self.pageField.action=@selector(page:);self.pageField.autoresizingMask=NSViewMinYMargin;[root addSubview:self.pageField];
     self.setJumpButton=[NSButton buttonWithTitle:@"Set Point" target:self action:@selector(quickSetJumpPoint:)];self.setJumpButton.frame=NSMakeRect(350,782,82,28);self.setJumpButton.autoresizingMask=NSViewMinYMargin;self.setJumpButton.toolTip=@"Set jump point (⌘D). Set a named point with ⇧⌘D or right-click.";[root addSubview:self.setJumpButton];
     self.setJumpButton.menu=[NSMenu new];[self item:@"Set Named Jump Point…" action:@selector(setJumpPoint:) key:@"" menu:self.setJumpButton.menu];
@@ -158,7 +161,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     self.latestVersionButton=[NSButton buttonWithTitle:@"v1/1" target:self action:@selector(latestVersion:)];self.latestVersionButton.toolTip=@"Return to latest PDF version (⌥⌘0)";
     self.nextVersionButton=[NSButton buttonWithTitle:@"›" target:self action:@selector(nextVersion:)];self.nextVersionButton.toolTip=@"Next PDF version (⌥⌘])";[self.nextVersionButton setAccessibilityLabel:@"Next PDF version"];
     for(NSButton *button in @[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]){button.font=[NSFont systemFontOfSize:11];[root addSubview:button];}
-    self.jumpBar=[[NSScrollView alloc]initWithFrame:NSMakeRect(440,782,0,28)];self.jumpBar.autoresizingMask=NSViewMinYMargin;self.jumpBar.hasHorizontalScroller=YES;self.jumpBar.scrollerStyle=NSScrollerStyleOverlay;self.jumpBar.autohidesScrollers=YES;self.jumpBar.drawsBackground=NO;[root addSubview:self.jumpBar];[self refreshJumpMenus];
+    self.jumpBar=[[NSScrollView alloc]initWithFrame:NSMakeRect(440,782,0,28)];self.jumpBar.autoresizingMask=NSViewMinYMargin;self.jumpBar.hasHorizontalScroller=NO;self.jumpBar.scrollerStyle=NSScrollerStyleOverlay;self.jumpBar.autohidesScrollers=YES;self.jumpBar.drawsBackground=NO;[root addSubview:self.jumpBar];[self refreshJumpMenus];
     self.search=[[NSSearchField alloc]initWithFrame:NSMakeRect(650,784,315,24)];self.search.placeholderString=@"Find in PDF";self.search.target=self;self.search.action=@selector(search:);self.search.delegate=self;self.search.sendsWholeSearchString=YES;self.search.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;[root addSubview:self.search];
     self.previousSearchButton=[NSButton buttonWithTitle:@"‹" target:self action:@selector(previousSearch:)];self.nextSearchButton=[NSButton buttonWithTitle:@"›" target:self action:@selector(search:)];
     [self.previousSearchButton setAccessibilityLabel:@"Previous search match"];[self.nextSearchButton setAccessibilityLabel:@"Next search match"];
@@ -406,30 +409,40 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 - (void)refreshJumpMenus {
     [self fillJumpMenu:self.jumpMenu];self.setJumpButton.enabled=self.pdf.document!=nil;
     if(!self.jumpBar)return;
-    NSPoint scroll=self.jumpBar.contentView.bounds.origin;NSView *row=[[NSView alloc]initWithFrame:NSMakeRect(0,0,1,28)];CGFloat x=0;
+    NSPoint scroll=self.jumpBar.contentView.bounds.origin;NSView *row=[[NSView alloc]initWithFrame:NSMakeRect(0,0,1,40)];CGFloat x=0;
     NSUInteger slot=0;for(NSDictionary *point in self.jumpPoints){
         NSString *key=slot<9?[NSString stringWithFormat:@"  ⌘%lu",(unsigned long)slot+1]:@"";
         NSString *title=point[@"name"];CGFloat width=MIN(116,MAX(28,[title sizeWithAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:13]}].width+18));
-        NSButton *jump=[NSButton buttonWithTitle:title target:self action:@selector(jumpButton:)];jump.frame=NSMakeRect(x,1,width,26);jump.identifier=point[@"id"];jump.enabled=self.pdf.document!=nil;[jump.cell setLineBreakMode:NSLineBreakByTruncatingTail];jump.toolTip=[NSString stringWithFormat:@"Jump to %@ — Page %ld%@",point[@"name"],(long)[point[@"page"] integerValue]+1,key];[row addSubview:jump];
+        NSButton *jump=[NSButton buttonWithTitle:title target:self action:@selector(jumpButton:)];jump.frame=NSMakeRect(x,4,width,32);jump.identifier=point[@"id"];jump.enabled=self.pdf.document!=nil;[jump.cell setLineBreakMode:NSLineBreakByTruncatingTail];jump.toolTip=[NSString stringWithFormat:@"Jump to %@ — Page %ld%@",point[@"name"],(long)[point[@"page"] integerValue]+1,key];[row addSubview:jump];
         NSMenu *context=[NSMenu new];context.autoenablesItems=NO;
         NSMenuItem *go=[self item:@"Jump to Point" action:@selector(jumpToPoint:) key:@"" menu:context];go.representedObject=point[@"id"];go.enabled=self.pdf.document!=nil;
         NSMenuItem *rename=[self item:@"Rename…" action:@selector(renameJumpPoint:) key:@"" menu:context];rename.representedObject=point[@"id"];
         NSMenuItem *remove=[self item:@"Remove Jump Point" action:@selector(removeJumpPoint:) key:@"" menu:context];remove.representedObject=point[@"id"];jump.menu=context;
         [jump setAccessibilityLabel:[NSString stringWithFormat:@"Jump to %@%@",point[@"name"],key]];x+=width+4;slot++;
     }
-    self.jumpContentWidth=x;[self layoutJumpControls];row.frame=NSMakeRect(0,0,MAX(x,self.jumpBar.contentSize.width),28);self.jumpBar.documentView=row;
+    self.jumpContentWidth=x;[self layoutJumpControls];row.frame=NSMakeRect(0,0,MAX(x,self.jumpBar.contentSize.width),40);self.jumpBar.documentView=row;
     [self.jumpBar.contentView scrollToPoint:[self.jumpBar.contentView constrainBoundsRect:(NSRect){scroll,self.jumpBar.contentView.bounds.size}].origin];
 }
 - (void)layoutJumpControls {
     if(!self.jumpBar)return;
     NSSize size=self.window.contentView.bounds.size;BOOL showHistory=self.history.count>1;
+    CGFloat historyWidth=showHistory?110:0,pointWidth=self.jumpPoints.count?self.jumpContentWidth+8:0;
+    self.toolbarOverflow=size.width<440+historyWidth+pointWidth+256;
+    // Regular-height buttons and a taller scroll viewport avoid macOS 27 bezel clipping.
+    CGFloat top=size.height-42,row=self.toolbarOverflow?top-42:top;
+    for(NSButton *button in self.baseButtons){NSRect frame=button.frame;frame.origin.y=top;frame.size.height=32;button.frame=frame;}
+    self.pageField.frame=NSMakeRect(293,top+4,48,24);self.setJumpButton.frame=NSMakeRect(350,top,82,32);
+    CGFloat start=self.toolbarOverflow?12:440;
     self.previousVersionButton.hidden=!showHistory;self.latestVersionButton.hidden=!showHistory;self.nextVersionButton.hidden=!showHistory;
-    self.previousVersionButton.frame=NSMakeRect(440,size.height-38,22,28);self.latestVersionButton.frame=NSMakeRect(464,size.height-38,54,28);self.nextVersionButton.frame=NSMakeRect(520,size.height-38,22,28);
-    CGFloat start=showHistory?550:440;CGFloat available=MAX(0,size.width-start-12);
-    CGFloat width=self.jumpPoints.count?MIN(self.jumpContentWidth,MAX(0,available-168)):0;
-    self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(start,size.height-38,width,28);
-    CGFloat searchX=start+width+(self.jumpPoints.count?8:0);self.search.frame=NSMakeRect(searchX,size.height-36,MAX(0,size.width-searchX-76),24);
-    self.previousSearchButton.frame=NSMakeRect(size.width-72,size.height-38,28,28);self.nextSearchButton.frame=NSMakeRect(size.width-40,size.height-38,28,28);
+    self.previousVersionButton.frame=NSMakeRect(start,row,22,32);self.latestVersionButton.frame=NSMakeRect(start+24,row,54,32);self.nextVersionButton.frame=NSMakeRect(start+80,row,22,32);
+    start+=historyWidth;
+    CGFloat available=MAX(0,size.width-start-12),width=self.jumpPoints.count?MIN(self.jumpContentWidth,self.toolbarOverflow?available:MAX(0,available-256)):0;
+    self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(start,row-4,width,40);
+    if(self.jumpBar.documentView){NSRect frame=self.jumpBar.documentView.frame;frame.size=NSMakeSize(MAX(self.jumpContentWidth,self.jumpBar.contentSize.width),40);self.jumpBar.documentView.frame=frame;}
+    CGFloat searchX=self.toolbarOverflow?440:start+width+(self.jumpPoints.count?8:0);
+    self.search.frame=NSMakeRect(searchX,top+4,MAX(0,size.width-searchX-76),24);
+    self.previousSearchButton.frame=NSMakeRect(size.width-72,top,28,32);self.nextSearchButton.frame=NSMakeRect(size.width-40,top,28,32);
+    self.pdf.frame=NSMakeRect(0,30,size.width,MAX(0,size.height-30-(self.toolbarOverflow?94:52)));
 }
 - (void)jumpButton:(NSButton *)sender {NSMenuItem *item=[NSMenuItem new];item.representedObject=sender.identifier;[self jumpToPoint:item];}
 - (void)quickSetJumpPoint:(id)sender {if(self.pdf.document)[self queueJumpName:@"" snapshot:[self jumpSnapshot]];}
@@ -565,6 +578,9 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     if([op isEqual:@"prepareSelectedJump"]){NSUInteger i=[self.jumpPoints indexOfObjectPassingTest:^BOOL(NSDictionary *p,NSUInteger i,BOOL *stop){return [p[@"id"] isEqual:self.event[@"jumpID"]];}];return @([self prepareJump:i==NSNotFound?-1:(NSInteger)i navigate:YES]);}
     if([op isEqual:@"addJump"]){if(self.pdf.document)[self queueJumpName:a[0] snapshot:[self jumpSnapshot]];return @0;}
     if([op isEqual:@"jump"]||[op isEqual:@"removeJump"]){NSMenuItem *item=[NSMenuItem new];item.representedObject=a[0];if([op isEqual:@"jump"])[self jumpToPoint:item];else [self removeJumpPoint:item];return @0;}
+    if([op isEqual:@"testPointScroll"]){CGEventRef event=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitPixel,2,0,-300);[self.jumpBar scrollWheel:[NSEvent eventWithCGEvent:event]];CFRelease(event);return @0;}
+    if([op isEqual:@"testSize"]){[self.window setContentSize:NSMakeSize([a[0] doubleValue],[a[1] doubleValue])];[self layoutJumpControls];return @0;}
+    if([op isEqual:@"inspectToolbar"]){NSMutableArray *frames=[NSMutableArray new];NSMutableArray *controls=[self.baseButtons mutableCopy];[controls addObjectsFromArray:@[self.pageField,self.setJumpButton,self.search,self.previousSearchButton,self.nextSearchButton]];if(self.history.count>1)[controls addObjectsFromArray:@[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]];for(NSView *view in controls)[frames addObject:NSStringFromRect(view.frame)];return @{@"overflow":@(self.toolbarOverflow),@"frames":frames,@"bounds":NSStringFromRect(self.window.contentView.bounds),@"pdf":NSStringFromRect(self.pdf.frame),@"scrollHeight":@(self.jumpBar.contentSize.height),@"scrollX":@(self.jumpBar.contentView.bounds.origin.x),@"pointHeight":@(self.jumpBar.documentView.subviews.firstObject.frame.size.height),@"searchWidth":@(self.search.frame.size.width)};}
     if([op isEqual:@"testSearch"]){self.search.stringValue=a[0];[self controlTextDidChange:[NSNotification notificationWithName:NSControlTextDidChangeNotification object:self.search]];return @0;}
     if([op isEqual:@"testSearchStep"]){if([a[0] integerValue]<0)[self.previousSearchButton performClick:nil];else [self.nextSearchButton performClick:nil];return @0;}
     if([op isEqual:@"inspectSearch"]){NSMutableArray *pages=[NSMutableArray new];for(PDFSelection *match in self.pdf.highlightedSelections)[pages addObject:@([self.pdf.document indexForPage:match.pages.firstObject])];return @{@"query":self.searchQuery?:@"",@"count":@(self.searchMatches.count),@"highlighted":@(self.pdf.highlightedSelections.count),@"index":@(self.searchIndex),@"pages":pages,@"selection":self.pdf.currentSelection.string?:@"",@"previousEnabled":@(self.previousSearchButton.enabled),@"nextEnabled":@(self.nextSearchButton.enabled),@"previousY":@(self.previousSearchButton.frame.origin.y),@"nextY":@(self.nextSearchButton.frame.origin.y),@"searchY":@(self.search.frame.origin.y),@"tooltip":self.search.toolTip?:@""};}

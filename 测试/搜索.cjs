@@ -17,7 +17,7 @@ function* scenario(){
  check(s.pages.filter(p=>p===0).length===32&&s.pages.filter(p=>p===2).length===32,'highlights cover matches on every matching page');
  check(s.index===0&&s.selection.toLowerCase()==='alpha','typing selects the first result');
  check(s.previousEnabled&&s.nextEnabled,'both search buttons are enabled for matches');
- check(s.previousY===s.nextY&&Math.abs(s.searchY-s.nextY)<=2,'search and both navigation buttons stay in the same toolbar row');
+ check(s.previousY===s.nextY&&Math.abs(s.searchY-s.nextY)<=4,'search and both navigation buttons stay in the same toolbar row');
  call(one,'testSearchStep',[1]);s=search(one);check(s.index===1&&s.highlighted===64,'Next advances while keeping all matches highlighted');
  call(one,'testSearchStep',[-1]);check(search(one).index===0,'Previous returns to the preceding result');
  call(one,'testSearchStep',[-1]);s=search(one);check(s.index===63&&state(one).page===2,'Previous wraps from first to last match');
