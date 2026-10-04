@@ -33,8 +33,8 @@ cat > "$BUNDLE/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>阅卷</string>
 <key>CFBundleIconFile</key><string>图标.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleVersion</key><string>5</string>
-<key>CFBundleShortVersionString</key><string>0.2.3</string>
+<key>CFBundleVersion</key><string>6</string>
+<key>CFBundleShortVersionString</key><string>0.2.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>

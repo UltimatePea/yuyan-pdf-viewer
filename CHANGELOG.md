@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.4 — 2026-10-04
+
+- Highlight every case-insensitive search match as the query changes, with a distinct active result.
+- Add Previous and Next search buttons beside the search field. Both directions wrap around; ⌘G finds the next match and ⇧⌘G finds the previous match. The tooltip shows the current result and total.
+- Recompute highlights when the displayed PDF refreshes or switches versions, preserving the reading position until search navigation is requested. Keep search state independent in each window.
+- Clear stale highlights for empty queries, missing results and closed documents; disable navigation when there are no matches. Keep all controls in the single toolbar row.
+
 ## v0.2.3 — 2026-10-03
 
 - Rename saved jump points from their toolbar context menu or the Jump Points menu. Labels update immediately and persist, while the saved location, stable ID, button order and keyboard shortcut remain unchanged.
