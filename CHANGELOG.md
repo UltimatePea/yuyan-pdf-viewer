@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.5 — 2026-10-04
+
+- Fix a crash while opening certain LaTeX PDFs on macOS 27. PDFKit can return a negative line-range length encoded as a huge unsigned value; reading that selection's text causes a fatal CoreFoundation trap.
+- Validate every selection range against the page's character count with overflow-safe bounds checks before extracting text. Skip invalid lines while retaining rendering, valid text anchors, search and version history.
+- Apply the same validation to search matches before using them for highlighting and navigation. Preserve the skipped-line count with each historical snapshot.
+- Reproduced the original trap and verified the fix against a copy of the supplied 51-page PDF. The PDF and TeX sources are not modified.
+
 ## v0.2.4 — 2026-10-04
 
 - Highlight every case-insensitive search match as the query changes, with a distinct active result.

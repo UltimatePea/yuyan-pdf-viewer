@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.4-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.5-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -22,6 +22,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.4-macos-arm64.zip`, then open `阅卷.app` or move 
 - Search highlights all matches as you type. Previous and Next buttons sit beside the search field; **⌘G** / **⇧⌘G** navigate matches with wraparound. Search results update after refreshes and version changes, independently in each window.
 - File and directory notifications detect in-place rewrites, atomic replacement and delete/recreate cycles.
 - Debounced reloads retain the last valid PDF through partial writes and reject stale asynchronous results.
+- Invalid text ranges reported by PDFKit are skipped before text extraction, preventing fatal range-conversion crashes while keeping the PDF available for reading.
 - The bottom status shows the last successful PDF update in system-local time, including seconds (`YYYY-MM-DD HH:mm:ss`); unchanged content does not reset it.
 - Text anchors preserve the reading passage and its viewport position across page insertion/deletion, with coordinate fallback for image-only pages.
 - Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
@@ -64,7 +65,7 @@ YY_ROOT=/path/to/yuyan-wktree-1 ./构建.sh
 YY_ROOT=/path/to/yuyan-wktree-1 ./发布.sh
 ```
 
-Tests run in the background without activating the app. Set `YY_VIEWER_BACKGROUND=1` when running an individual test script. Tests run the actual Yuyan Wasm-GC application with PDFKit. The integration suite also requires `latexmk` and LaTeX. A logged-in macOS graphical session is required.
+Tests run in the background without activating the app. Set `YY_VIEWER_BACKGROUND=1` when running an individual test script. Tests run the actual Yuyan Wasm-GC application with PDFKit. The integration suite also requires `latexmk` and LaTeX. A logged-in macOS graphical session is required. To run the private-document crash regression as well, set `YY_CRASH_PDF=/path/to/test-copy.pdf`; the test creates another temporary copy and never rewrites the supplied file.
 
 ```sh
 # Navigate an already-open PDF after compilation:
