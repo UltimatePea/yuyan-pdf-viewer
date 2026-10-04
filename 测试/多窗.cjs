@@ -1,0 +1,72 @@
+'use strict';
+process.env.YY_VIEWER_BACKGROUND='1';
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),assert=require('node:assert/strict');
+const {pdf}=require('./夹具.cjs');
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'阅卷 多窗 '));
+process.env.YY_JUMP_POINTS_DIRECTORY=path.join(root,'points');
+const first=path.join(root,'first.pdf'),second=path.join(root,'second.pdf');
+fs.writeFileSync(first,pdf(['Alpha','Beta','Gamma']));fs.writeFileSync(second,pdf(['Other','Second']));
+let api,checks=0;
+const call=(id,op,args=[])=>api('window',[id,op,args]);
+const state=id=>call(id,'inspect');
+function check(value,message){assert.ok(value,message);checks++;console.log('PASS '+message);}
+function* wait(f,label){let start=Date.now();while(!f()){if(Date.now()-start>15000)throw Error('Timeout '+label);yield;}}
+function* delay(ms){let start=Date.now();while(Date.now()-start<ms)yield;}
+function* scenario(){
+ const one=api('inspectWindows')[0].id;
+ yield* wait(()=>state(one).pages===3,'first');
+ call(one,'testPosition',[2,1.3,500]);call(one,'addJump',['']);
+ yield* wait(()=>call(one,'inspectJumps').length===1,'point');
+ const before=call(one,'inspectJumps')[0];
+ check(before.name==='A','automatic jump point label starts at A');
+ check(call(one,'renameJump',[before.id,'  Conclusion 结论  ']),'saved checkpoint can be renamed');
+ const after=call(one,'inspectJumps')[0];
+ check(after.name==='Conclusion 结论','rename trims whitespace and supports Unicode');
+ const ui=call(one,'inspectUI');check(ui.buttons[0].title===after.name&&ui.buttons[0].actions.includes('Rename…'),'toolbar label updates and exposes Rename in its context menu');
+ check(ui.pointY===ui.setY&&ui.historyY===ui.setY&&Math.abs(ui.searchY-ui.setY)<=2,'jump points and history controls remain on a single toolbar row');
+ check(!ui.active&&!ui.visible&&!ui.canBecomeKey&&!ui.canBecomeMain,'background test windows are hidden and cannot take focus');
+ check(JSON.stringify({...after,name:before.name})===JSON.stringify(before),'rename preserves stable ID, location, anchors, and ordering');
+ check(!call(one,'renameJump',[before.id,' \n ']),'blank rename leaves the saved name intact');
+ check(!call(one,'renameJump',['missing','Other']),'stale rename cannot change another point');
+ call(one,'addJump',['']);yield* wait(()=>call(one,'inspectJumps').length===2,'second point');
+ check(call(one,'inspectJumps')[1].name==='A','renamed automatic label becomes available again');
+ const two=api('openNew',[second]);yield* wait(()=>state(two).pages===2,'second');
+ check(api('inspectWindows').length===2&&state(one).path===first,'opening another document creates a separate window');
+ check(state(one).page===2&&Math.abs(state(one).zoom-1.3)<.001,'opening another window preserves reading position and zoom');
+ check(call(two,'inspectJumps').length===0,'jump points belong to their document');
+ check(api('openNew',[first])===one&&api('inspectWindows').length===2,'reopening an already open document reuses its window');
+ call(one,'testDelay',[.25]);call(two,'testDelay',[.05]);
+ fs.writeFileSync(first,pdf(['Inserted','Alpha','Beta','Gamma']));fs.writeFileSync(second,pdf(['Other','Second','Third']));
+ yield* wait(()=>state(one).pages===4&&state(two).pages===3,'simultaneous refresh');
+ check(state(one).versionCount===2&&state(two).versionCount===2,'concurrent refreshes retain independent histories');
+ check(state(one).page===3,'background refresh follows the reading passage');
+ call(one,'history',[0]);yield* wait(()=>state(one).versionIndex===0,'history');
+ fs.writeFileSync(second,pdf(['New','Other','Second','Third']));
+ yield* wait(()=>state(two).pages===4,'second live refresh');
+ check(state(one).pages===3&&state(one).versionIndex===0,'browsing history in one window does not interrupt another');
+ call(one,'jump',[before.id]);yield* delay(200);
+ check(state(one).page===2&&call(one,'inspectJumps')[0].name===after.name,'renamed point jumps correctly in history');
+ call(one,'historyStep',[0]);yield* wait(()=>state(one).versionIndex===1,'latest');
+ call(one,'testPosition',[0,1.3,500]);call(one,'jump',[before.id]);yield* wait(()=>state(one).page===3,'renamed rebuilt jump');
+ check(call(one,'inspectJumps')[0].name===after.name,'rename survives rebuild and rematching');
+ const blank=api('openNew',[]);check(api('inspectWindows').length===3,'New Window creates an empty window');
+ const next=call(one,'testWindowShortcut',[false]),previous=call(one,'testWindowShortcut',[true]);
+ check(next.handled&&next.target===two,'Cmd-backtick dispatches the next-window action');
+ check(previous.handled&&previous.target===blank,'Shift-Cmd-backtick dispatches the previous-window action');
+ check(call(blank,'testWindowShortcut',[false]).target===one,'window cycling wraps to the first window');
+ const third=path.join(root,'third.pdf');fs.writeFileSync(third,pdf(['Third']));
+ check(api('openNew',[third])===blank,'opening a PDF reuses an empty window');yield* wait(()=>state(blank).pages===1,'third');
+ call(blank,'closeWindow');check(api('inspectWindows').length===2,'closing an auxiliary window leaves the others open');
+ call(one,'testDelay',[.4]);fs.writeFileSync(first,pdf(['pending']));yield* delay(220);
+ call(one,'closeWindow');check(api('inspectWindows').length===1&&state(two).pages===4,'closing the original window keeps the other document usable');
+ fs.writeFileSync(second,pdf(['Still live']));yield* wait(()=>state(two).pages===1,'remaining refresh');
+ check(state(two).versionCount===4,'remaining window keeps reloading after the original closes');
+ fs.writeFileSync(first,pdf(['Inserted','Alpha','Beta','Gamma']));
+ const reopened=api('openNew',[first]);yield* wait(()=>state(reopened).pages===4,'reopen');
+ check(state(reopened).versionCount>=2,'history remains in memory after closing and reopening its window');
+ check(call(reopened,'inspectJumps')[0].name===after.name,'renamed checkpoint persists after its window is closed and reopened');
+ call(reopened,'removeJump',[before.id]);check(!call(reopened,'renameJump',[before.id,'Gone']),'removed checkpoint cannot be resurrected by rename');
+ call(two,'closeWindow');call(reopened,'closeWindow');check(api('inspectWindows').length===0,'closing the last window ends the app cleanly');
+ console.log(JSON.stringify({passed:checks,directory:root}));
+}
+let last=0,flow=scenario();try{require('../源码/宿主.cjs').run({pdf:first,hook:a=>{api=a;if(Date.now()-last<15)return;last=Date.now();flow.next();}});}catch(error){console.error(error);process.exitCode=1;if(api)api('quit');}

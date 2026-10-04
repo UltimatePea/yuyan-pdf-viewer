@@ -24,10 +24,25 @@ static NSArray *Lines(PDFDocument *doc) {
     return out;
 }
 @class Viewer;
-static Viewer *V;
+static Viewer *V, *AppDelegate;
+static NSMutableArray<Viewer *> *Windows;
+static BOOL Quitting;
+static NSMutableDictionary *Histories;
+static NSUInteger WindowSerial, PollIndex;
+static Viewer *OpenWindow(NSString *path);
+static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY_VIEWER_BACKGROUND"] isEqual:@"1"]; }
+@interface ViewerWindow : NSWindow @end
+@implementation ViewerWindow
+- (BOOL)canBecomeKeyWindow {return !Background()&&[super canBecomeKeyWindow];}
+- (BOOL)canBecomeMainWindow {return !Background()&&[super canBecomeMainWindow];}
+@end
 @interface DropPDF : PDFView <NSDraggingDestination> @end
 @interface Viewer : NSObject <NSApplicationDelegate,NSWindowDelegate>
 @property NSWindow *window;
+@property NSMenu *menuBar,*windowMenu;
+@property NSNumber *cycleDestination;
+@property NSArray *scheduler;
+@property NSNumber *windowID;
 @property DropPDF *pdf;
 @property NSTextField *status,*pageField;
 @property NSSearchField *search;
@@ -53,7 +68,7 @@ static Viewer *V;
 @property double testDelay;
 @property NSTimeInterval healthTime;
 @property NSUInteger session,commits,loads,watchCount;
-@property BOOL quitting,follow,fit;
+@property BOOL follow,fit;
 @property NSInteger fallbackPage;
 @property NSPoint fallbackPoint,fallbackOffset;
 @property CGFloat savedScale;
@@ -74,25 +89,27 @@ static Viewer *V;
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {return NSDragOperationCopy;}
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
     NSArray *urls=[sender.draggingPasteboard readObjectsForClasses:@[NSURL.class] options:@{NSPasteboardURLReadingFileURLsOnlyKey:@YES}];
-    if(!urls.count)return NO; [V performSelector:@selector(openPath:) withObject:[urls[0] path]]; return YES;
+    if(!urls.count)return NO;for(NSURL *url in urls)OpenWindow(url.path);return YES;
 }
 @end
 @implementation Viewer
 - (void)enqueue:(NSInteger)kind generation:(NSInteger)g { [self.events addObject:@{@"kind":@(kind),@"generation":@(g)}]; }
 - (NSMenuItem *)item:(NSString *)title action:(SEL)action key:(NSString *)key menu:(NSMenu *)menu {NSMenuItem *i=[menu addItemWithTitle:title action:action keyEquivalent:key];i.target=self;return i;}
 - (void)setup {
+    self.scheduler=@[@0,@0,@0,@0];self.windowID=@(++WindowSerial);[Windows addObject:self];
     self.events=[NSMutableArray new]; self.lines=@[];self.anchors=@[];self.fit=YES;
-    self.histories=[NSMutableDictionary new];self.versionIndex=-1;
+    self.histories=Histories;self.versionIndex=-1;
     self.readQueue=dispatch_queue_create("org.yuyan.reader.pdf",DISPATCH_QUEUE_SERIAL);
-    [NSApplication sharedApplication]; NSApp.delegate=self; [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    NSMenu *bar=[NSMenu new]; NSApp.mainMenu=bar;
+    [NSApplication sharedApplication];if(!AppDelegate){AppDelegate=self;NSApp.delegate=self;[NSApp setActivationPolicy:Background()?NSApplicationActivationPolicyProhibited:NSApplicationActivationPolicyRegular];}
+    NSMenu *bar=[NSMenu new];self.menuBar=bar;NSApp.mainMenu=bar;
     NSMenu *app=[NSMenu new]; NSMenuItem *appItem=[bar addItemWithTitle:@"阅卷" action:nil keyEquivalent:@""];appItem.submenu=app;
     [self item:@"About 阅卷" action:@selector(about:) key:@"" menu:app];[app addItem:NSMenuItem.separatorItem];
     [self item:@"Quit 阅卷" action:@selector(quit:) key:@"q" menu:app];
     NSMenu *file=[[NSMenu alloc]initWithTitle:@"File"];[bar addItemWithTitle:@"File" action:nil keyEquivalent:@""].submenu=file;
+    [self item:@"New Window" action:@selector(newWindow:) key:@"n" menu:file];
     [self item:@"Open…" action:@selector(open:) key:@"o" menu:file];
     [self item:@"Reload" action:@selector(reload:) key:@"r" menu:file];
-    [self item:@"Close Document" action:@selector(closeDocument:) key:@"w" menu:file];
+    [self item:@"Close Window" action:@selector(closeWindow:) key:@"w" menu:file];
     [self item:@"Print…" action:@selector(print:) key:@"p" menu:file];
     NSMenu *edit=[[NSMenu alloc]initWithTitle:@"Edit"];[bar addItemWithTitle:@"Edit" action:nil keyEquivalent:@""].submenu=edit;
     [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
@@ -111,8 +128,12 @@ static Viewer *V;
     self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
     [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
     self.versionsMenu=[[NSMenu alloc]initWithTitle:@"Versions"];[bar addItemWithTitle:@"Versions" action:nil keyEquivalent:@""].submenu=self.versionsMenu;
-    self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(180,100,980,820) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
-    self.window.title=@"阅卷 — PDF";self.window.delegate=self; self.window.releasedWhenClosed=NO;
+    self.windowMenu=[[NSMenu alloc]initWithTitle:@"Window"];[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""].submenu=self.windowMenu;
+    [self item:@"Cycle Through Windows" action:@selector(nextWindow:) key:@"`" menu:self.windowMenu];
+    NSMenuItem *reverse=[self item:@"Cycle Backward Through Windows" action:@selector(previousWindow:) key:@"~" menu:self.windowMenu];reverse.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagShift;
+    NSApp.windowsMenu=self.windowMenu;
+    self.window=[[ViewerWindow alloc]initWithContentRect:NSMakeRect(180,100,980,820) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskResizable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
+    self.window.tabbingMode=NSWindowTabbingModeDisallowed;self.window.title=@"阅卷 — PDF";self.window.delegate=self; self.window.releasedWhenClosed=NO;
     self.window.minSize=NSMakeSize(760,420);
     NSView *root=self.window.contentView;
     self.pdf=[[DropPDF alloc]initWithFrame:NSMakeRect(0,30,980,744)];self.pdf.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
@@ -135,16 +156,26 @@ static Viewer *V;
     self.status=[NSTextField labelWithString:@"Open a PDF to begin"];self.status.frame=NSMakeRect(12,6,956,18);self.status.autoresizingMask=NSViewWidthSizable;self.status.lineBreakMode=NSLineBreakByTruncatingMiddle;[root addSubview:self.status];
     [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(pageChanged:) name:PDFViewPageChangedNotification object:self.pdf];
     [[NSDistributedNotificationCenter defaultCenter]addObserver:self selector:@selector(navigationRequest:) name:@"org.yuyan.reader.navigate" object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
-    [NSApp finishLaunching];[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];
+    if(self==AppDelegate)[NSApp finishLaunching];if(!Background()){[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}
 }
 - (void)about:(id)sender {NSAlert *a=[NSAlert new];a.messageText=@"阅卷";a.informativeText=@"Yuyan · Wasm-GC · V8\nNative PDFKit viewer for continuously rebuilt papers.";[a beginSheetModalForWindow:self.window completionHandler:nil];}
 - (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];}
 - (void)windowDidResize:(NSNotification *)n {[self layoutJumpControls];if(self.fit)[self fitWidth:nil];}
-- (void)windowWillClose:(NSNotification *)n {[self closeDocument:nil];self.quitting=YES;}
-- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {self.quitting=YES;return NSTerminateCancel;}
-- (BOOL)application:(NSApplication *)app openFile:(NSString *)filename {[self openPath:filename];return YES;}
-- (void)quit:(id)sender {self.quitting=YES;}
-- (void)open:(id)sender {NSOpenPanel *p=[NSOpenPanel openPanel];p.allowedContentTypes=@[UTTypePDF];[p beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r){if(r==NSModalResponseOK)[self openPath:p.URL.path];}];}
+- (void)windowDidBecomeKey:(NSNotification *)n {NSApp.mainMenu=self.menuBar;NSApp.windowsMenu=self.windowMenu;}
+- (void)cycleWindow:(NSInteger)step {
+    NSUInteger index=[Windows indexOfObject:self];if(index==NSNotFound||!Windows.count)return;
+    Viewer *target=Windows[((NSInteger)index+step+(NSInteger)Windows.count)%Windows.count];self.cycleDestination=target.windowID;
+    if(!Background()){if(target.window.miniaturized)[target.window deminiaturize:nil];[target.window makeKeyAndOrderFront:nil];}
+}
+- (void)nextWindow:(id)sender {[self cycleWindow:1];}
+- (void)previousWindow:(id)sender {[self cycleWindow:-1];}
+- (void)windowWillClose:(NSNotification *)n {[self closeDocument:nil];[[NSNotificationCenter defaultCenter]removeObserver:self];[[NSDistributedNotificationCenter defaultCenter]removeObserver:self];[Windows removeObject:self];if(!Windows.count)Quitting=YES;}
+- (void)closeWindow:(id)sender {[self.window performClose:sender];}
+- (void)newWindow:(id)sender {OpenWindow(nil);}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {Quitting=YES;return NSTerminateCancel;}
+- (BOOL)application:(NSApplication *)app openFile:(NSString *)filename {OpenWindow(filename);return YES;}
+- (void)quit:(id)sender {Quitting=YES;}
+- (void)open:(id)sender {NSOpenPanel *p=[NSOpenPanel openPanel];p.allowedContentTypes=@[UTTypePDF];p.allowsMultipleSelection=YES;[p beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse r){if(r==NSModalResponseOK)for(NSURL *url in p.URLs)OpenWindow(url.path);}];}
 - (void)stopWatch {if(self.watch){dispatch_source_cancel(self.watch);self.watch=nil;}if(self.fileWatch){dispatch_source_cancel(self.fileWatch);self.fileWatch=nil;}self.fileInode=0;self.directoryInode=0;self.watchCount=0;}
 - (void)armDirectoryWatch {
     NSString *directory=self.path.stringByDeletingLastPathComponent;struct stat st;
@@ -334,6 +365,7 @@ static Viewer *V;
         NSMenuItem *item=[menu addItemWithTitle:title action:nil keyEquivalent:@""];NSMenu *actions=[[NSMenu alloc]initWithTitle:title];actions.autoenablesItems=NO;item.submenu=actions;
         NSString *key=slot<9?[NSString stringWithFormat:@"%lu",(unsigned long)slot+1]:@"";slot++;
         NSMenuItem *jump=[self item:@"Jump to Point" action:@selector(jumpToPoint:) key:key menu:actions];jump.representedObject=point[@"id"];jump.enabled=self.pdf.document!=nil;
+        NSMenuItem *rename=[self item:@"Rename…" action:@selector(renameJumpPoint:) key:@"" menu:actions];rename.representedObject=point[@"id"];
         NSMenuItem *remove=[self item:@"Remove Jump Point" action:@selector(removeJumpPoint:) key:@"" menu:actions];remove.representedObject=point[@"id"];
     }
 }
@@ -347,6 +379,7 @@ static Viewer *V;
         NSButton *jump=[NSButton buttonWithTitle:title target:self action:@selector(jumpButton:)];jump.frame=NSMakeRect(x,1,width,26);jump.identifier=point[@"id"];jump.enabled=self.pdf.document!=nil;[jump.cell setLineBreakMode:NSLineBreakByTruncatingTail];jump.toolTip=[NSString stringWithFormat:@"Jump to %@ — Page %ld%@",point[@"name"],(long)[point[@"page"] integerValue]+1,key];[row addSubview:jump];
         NSMenu *context=[NSMenu new];context.autoenablesItems=NO;
         NSMenuItem *go=[self item:@"Jump to Point" action:@selector(jumpToPoint:) key:@"" menu:context];go.representedObject=point[@"id"];go.enabled=self.pdf.document!=nil;
+        NSMenuItem *rename=[self item:@"Rename…" action:@selector(renameJumpPoint:) key:@"" menu:context];rename.representedObject=point[@"id"];
         NSMenuItem *remove=[self item:@"Remove Jump Point" action:@selector(removeJumpPoint:) key:@"" menu:context];remove.representedObject=point[@"id"];jump.menu=context;
         [jump setAccessibilityLabel:[NSString stringWithFormat:@"Jump to %@%@",point[@"name"],key]];x+=width+4;slot++;
     }
@@ -384,6 +417,22 @@ static Viewer *V;
 }
 - (void)jumpToPoint:(NSMenuItem *)sender {
     if(self.pdf.document)[self.events addObject:@{@"kind":@5,@"jumpID":sender.representedObject}];
+}
+- (BOOL)renameJumpID:(NSString *)identifier name:(NSString *)name {
+    name=[name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if(!name.length){self.status.stringValue=@"A jump point name cannot be empty";return NO;}
+    for(NSMutableDictionary *point in self.jumpPoints)if([point[@"id"] isEqual:identifier]){
+        point[@"name"]=name;[self saveJumpPoints];[self refreshJumpMenus];return YES;
+    }return NO;
+}
+- (void)renameJumpPoint:(NSMenuItem *)sender {
+    NSString *identifier=sender.representedObject;NSDictionary *point=nil;
+    for(NSDictionary *p in self.jumpPoints)if([p[@"id"] isEqual:identifier]){point=p;break;}if(!point)return;
+    NSUInteger session=self.session;NSAlert *alert=[NSAlert new];alert.messageText=@"Rename Jump Point";alert.informativeText=@"Choose a name for this saved location.";
+    [alert addButtonWithTitle:@"Rename"];[alert addButtonWithTitle:@"Cancel"];
+    NSTextField *name=[[NSTextField alloc]initWithFrame:NSMakeRect(0,0,320,24)];name.stringValue=point[@"name"];alert.accessoryView=name;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response){if(response==NSAlertFirstButtonReturn&&session==self.session)[self renameJumpID:identifier name:name.stringValue];}];
+    [alert.window makeFirstResponder:name];[name selectText:nil];
 }
 - (void)removeJumpPoint:(NSMenuItem *)sender {
     NSIndexSet *indices=[self.jumpPoints indexesOfObjectsPassingTest:^BOOL(NSDictionary *p,NSUInteger i,BOOL *stop){return [p[@"id"] isEqual:sender.representedObject];}];
@@ -443,10 +492,8 @@ static Viewer *V;
 }
 - (id)invoke:(NSString *)op args:(NSArray *)a {
     if([op isEqual:@"notify"]){[[NSDistributedNotificationCenter defaultCenter]postNotificationName:@"org.yuyan.reader.navigate" object:nil userInfo:@{@"pdf":a[0],@"source":a[1],@"line":a[2]} deliverImmediately:YES];return @0;}
-    if([op isEqual:@"init"]){[self setup];if(a.count&&[a[0] length])[self openPath:a[0]];return @0;}
     if([op isEqual:@"poll"]){@autoreleasepool {
-        NSEvent *e=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate dateWithTimeIntervalSinceNow:.01] inMode:NSDefaultRunLoopMode dequeue:YES];if(e)[NSApp sendEvent:e];[NSApp updateWindows];
-        if(self.quitting)return @9;
+        if(Quitting)return @9;
         NSTimeInterval now=NSProcessInfo.processInfo.systemUptime;
         if(self.path&&now-self.healthTime>1){self.healthTime=now;[self armDirectoryWatch];[self armFileWatch];struct stat st;NSString *signature=stat(self.path.fileSystemRepresentation,&st)==0?[NSString stringWithFormat:@"%llu:%lld:%ld:%ld",(unsigned long long)st.st_ino,st.st_size,st.st_mtimespec.tv_sec,st.st_mtimespec.tv_nsec]:@"missing";
             if(self.fileSignature&&![self.fileSignature isEqual:signature])[self enqueue:2 generation:0];self.fileSignature=signature;
@@ -455,7 +502,10 @@ static Viewer *V;
         if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateDigest=self.event[@"digest"];self.candidateData=self.event[@"data"];self.candidateTime=nil;self.candidateVersionIndex=-1;}
         return self.event[@"kind"];
     }}
-    if([op isEqual:@"number"]){NSString *k=a[0];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"versions"])return @(self.history.count);if([k isEqual:@"versionIndex"])return @(self.versionIndex);if([k isEqual:@"same"])return @([self.history.lastObject[@"digest"] isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
+    if([op isEqual:@"saveScheduler"]){self.scheduler=[a copy];return @0;}
+    if([op isEqual:@"renameJump"])return @([self renameJumpID:a[0] name:a[1]]);
+    if([op isEqual:@"closeWindow"]){[self closeWindow:nil];return @0;}
+    if([op isEqual:@"number"]){NSString *k=a[0];if([k hasPrefix:@"scheduler"])return self.scheduler[[[k substringFromIndex:9] integerValue]];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"versions"])return @(self.history.count);if([k isEqual:@"versionIndex"])return @(self.versionIndex);if([k isEqual:@"same"])return @([self.history.lastObject[@"digest"] isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
     if([op isEqual:@"text"]){NSInteger i=[a[0] integerValue];NSArray *lines=[self matchLines];return i>=0&&i<lines.count?lines[i][@"text"]:@"";}
     if([op isEqual:@"oldtext"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.lines.count?self.lines[i][@"text"]:@"";}
     if([op isEqual:@"anchor"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"text"]:@"";}
@@ -480,11 +530,13 @@ static Viewer *V;
     if([op isEqual:@"prepareSelectedJump"]){NSUInteger i=[self.jumpPoints indexOfObjectPassingTest:^BOOL(NSDictionary *p,NSUInteger i,BOOL *stop){return [p[@"id"] isEqual:self.event[@"jumpID"]];}];return @([self prepareJump:i==NSNotFound?-1:(NSInteger)i navigate:YES]);}
     if([op isEqual:@"addJump"]){if(self.pdf.document)[self queueJumpName:a[0] snapshot:[self jumpSnapshot]];return @0;}
     if([op isEqual:@"jump"]||[op isEqual:@"removeJump"]){NSMenuItem *item=[NSMenuItem new];item.representedObject=a[0];if([op isEqual:@"jump"])[self jumpToPoint:item];else [self removeJumpPoint:item];return @0;}
+    if([op isEqual:@"testWindowShortcut"]){self.cycleDestination=nil;NSEventModifierFlags flags=NSEventModifierFlagCommand|([a[0] boolValue]?NSEventModifierFlagShift:0);NSEvent *event=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0 windowNumber:self.window.windowNumber context:nil characters:[a[0] boolValue]?@"~":@"`" charactersIgnoringModifiers:[a[0] boolValue]?@"~":@"`" isARepeat:NO keyCode:50];BOOL handled=[self.menuBar performKeyEquivalent:event];return @{@"handled":@(handled),@"target":self.cycleDestination?:@0};}
+    if([op isEqual:@"inspectUI"]){NSMutableArray *buttons=[NSMutableArray new];for(NSButton *button in self.jumpBar.documentView.subviews){NSMutableArray *actions=[NSMutableArray new];for(NSMenuItem *item in button.menu.itemArray)[actions addObject:item.title];[buttons addObject:@{@"title":button.title,@"actions":actions}];}return @{@"buttons":buttons,@"active":@(NSApp.active),@"visible":@(self.window.visible),@"canBecomeKey":@(self.window.canBecomeKeyWindow),@"canBecomeMain":@(self.window.canBecomeMainWindow),@"pointY":@(self.jumpBar.frame.origin.y),@"setY":@(self.setJumpButton.frame.origin.y),@"historyY":@(self.previousVersionButton.frame.origin.y),@"searchY":@(self.search.frame.origin.y)};}
     if([op isEqual:@"inspectJumps"])return self.jumpPoints?:@[];
     if([op isEqual:@"status"]){self.status.stringValue=[NSString stringWithFormat:@"%@ · %@",a[0],self.path?:@""];return @0;}
     if([op isEqual:@"open"]){[self openPath:a[0]];return @0;}
     if([op isEqual:@"close"]){[self closeDocument:nil];return @0;}
-    if([op isEqual:@"quit"]){self.quitting=YES;[self stopWatch];return @0;}
+    if([op isEqual:@"quit"]){Quitting=YES;for(Viewer *viewer in Windows)[viewer stopWatch];return @0;}
     if([op isEqual:@"testPosition"]){self.fit=NO;self.pdf.scaleFactor=[a[1] doubleValue];[self positionPage:[a[0] integerValue] point:NSMakePoint(72,[a[2] doubleValue]) offset:NSMakePoint(100,450)];return @0;}
     if([op isEqual:@"testDelay"]){self.testDelay=[a[0] doubleValue];return @0;}
     if([op isEqual:@"testFollow"]){self.follow=[a[0] boolValue];return @0;}
@@ -493,9 +545,29 @@ static Viewer *V;
     return @0;
 }
 @end
+// Window selection is separate from keyboard focus: each guest scheduler owns its state.
+static Viewer *OpenWindow(NSString *path) {
+    NSString *normalized=path.stringByStandardizingPath;
+    if(normalized.length)for(Viewer *viewer in Windows)if([viewer.path isEqual:normalized]){if(!Background()){if(viewer.window.miniaturized)[viewer.window deminiaturize:nil];[viewer.window makeKeyAndOrderFront:nil];}return viewer;}
+    Viewer *viewer=nil;if(normalized.length)for(Viewer *item in Windows)if(!item.path){viewer=item;break;}
+    if(!viewer){viewer=[Viewer new];[viewer setup];}
+    if(normalized.length)[viewer openPath:normalized];if(!Background()){if(viewer.window.miniaturized)[viewer.window deminiaturize:nil];[viewer.window makeKeyAndOrderFront:nil];}return viewer;
+}
+static id Dispatch(NSString *op,NSArray *args) {
+    if(!Windows){Windows=[NSMutableArray new];Histories=[NSMutableDictionary new];}
+    if([op isEqual:@"init"]){V=OpenWindow(args.count?args[0]:nil);return @0;}
+    if([op isEqual:@"openNew"])return OpenWindow(args.count?args[0]:nil).windowID;
+    if([op isEqual:@"inspectWindows"]){NSMutableArray *out=[NSMutableArray new];for(Viewer *viewer in Windows)[out addObject:@{@"id":viewer.windowID,@"path":viewer.path?:@""}];return out;}
+    if([op isEqual:@"window"]){for(Viewer *viewer in Windows)if([viewer.windowID isEqual:args[0]])return [viewer invoke:args[1] args:args[2]];return [NSNull null];}
+    if([op isEqual:@"poll"]){
+        NSEvent *event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:[NSDate dateWithTimeIntervalSinceNow:.01] inMode:NSDefaultRunLoopMode dequeue:YES];if(event)[NSApp sendEvent:event];[NSApp updateWindows];
+        if(Quitting)return @9;if(Windows.count)V=Windows[(PollIndex++)%Windows.count];
+    }
+    if(!V)V=[Viewer new];return [V invoke:op args:args];
+}
 static NSString *JSString(napi_env env,napi_value value){size_t size=0;napi_get_value_string_utf8(env,value,NULL,0,&size);char *s=calloc(size+1,1);napi_get_value_string_utf8(env,value,s,size+1,&size);NSString *r=[[NSString alloc]initWithBytes:s length:size encoding:NSUTF8StringEncoding];free(s);return r;}
 static napi_value Call(napi_env env,napi_callback_info info){@autoreleasepool {size_t count=2;napi_value argv[2];napi_get_cb_info(env,info,&count,argv,NULL,NULL);if(count!=2){napi_throw_error(env,NULL,"invoke requires operation and JSON args");return NULL;}
-    @try {if(!V)V=[Viewer new];NSString *op=JSString(env,argv[0]);NSArray *args=[NSJSONSerialization JSONObjectWithData:[JSString(env,argv[1]) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];id value=[V invoke:op args:args];NSData *data=[NSJSONSerialization dataWithJSONObject:value?:@0 options:NSJSONWritingFragmentsAllowed error:nil];napi_value result;napi_create_string_utf8(env,data.bytes,data.length,&result);return result;}
+    @try {NSString *op=JSString(env,argv[0]);NSArray *args=[NSJSONSerialization JSONObjectWithData:[JSString(env,argv[1]) dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];id value=Dispatch(op,args);NSData *data=[NSJSONSerialization dataWithJSONObject:value?:@0 options:NSJSONWritingFragmentsAllowed error:nil];napi_value result;napi_create_string_utf8(env,data.bytes,data.length,&result);return result;}
     @catch(NSException *exception){napi_throw_error(env,NULL,exception.reason.UTF8String);return NULL;}
 }}
 static napi_value Init(napi_env env,napi_value exports){napi_value f;napi_create_function(env,"invoke",NAPI_AUTO_LENGTH,Call,NULL,&f);napi_set_named_property(env,exports,"invoke",f);return exports;}

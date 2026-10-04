@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.3 — 2026-10-03
+
+- Rename saved jump points from their toolbar context menu or the Jump Points menu. Labels update immediately and persist, while the saved location, stable ID, button order and keyboard shortcut remain unchanged.
+- Open different PDFs in separate native windows through Open, Finder or drag-and-drop. Open accepts multiple files; New Window (⌘N) creates an empty window and Close Window (⌘W) closes only that window. An already open PDF reuses its existing window.
+- Cycle through windows with ⌘` (forward) and ⇧⌘` (backward), also available in the Window menu.
+- Keep independent Yuyan reload generations, debounce timers and retry state for each window. Concurrent rebuilds and background history browsing do not interfere with other documents.
+- Retain document history in memory after closing its window for the remainder of the app session. Closing the last window quits the app.
+- Preserve the single-row toolbar. Run native regression tests in background mode without activating the app.
+
 ## v0.2.2 — 2026-09-27
 
 ### Added
