@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.6-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.7-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -27,6 +27,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.6-macos-arm64.zip`, then open `阅卷.app` or move 
 - Text anchors preserve the reading passage and its viewport position across page insertion/deletion, with coordinate fallback for image-only pages.
 - Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
 - In-memory PDF version history with Previous, Next and Latest navigation.
+- Change highlights between consecutive versions: added words in green, words the next version deletes in red. On by default; **View → Highlight Changes** turns them off.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.
 
 Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content can fall back to the original page coordinates.
@@ -42,6 +43,18 @@ Every successfully loaded content change is retained as an immutable PDF snapsho
 - Invalid/partial reads, stale asynchronous results and consecutive identical content are excluded. Rapid builds overwritten before the viewer captures them cannot be recovered. A disk revert to earlier content is retained as a new chronological version.
 
 Explicit SyncTeX navigation returns to Latest, because the source and SyncTeX files describe the current build. [Changelog](CHANGELOG.md).
+
+## Change highlights
+
+Each version is compared with its neighbours, word by word. Words **added** since the previous version have a **green** background. While you view an older version, words that the **next version deletes** have a **red** background, so stepping back with **⌥⌘[** shows what an edit removed. The status bar reports the word counts, such as `+72 −147`. The latest version has only green highlights, and the first version only red ones.
+
+- On by default. **View → Highlight Changes** turns the highlights off or on in every window, and the choice persists across launches.
+- Layout changes are not changes. Margin line numbers (such as those of `lineno`), page numbers, running headers and footers, rebroken lines and words re-hyphenated at a line end are ignored. Text that only moved to another page, or that PDFKit reports in another order while it stands in the same place, is not marked. Text that really moved within a page is marked.
+- A rebuild that changes no words is passed over. Each version is compared with the nearest earlier and the nearest later version whose words differ, so a rebuild without edits keeps the highlights of the last change.
+- Change highlights and search highlights are shown together, and are rebuilt after refreshes, version changes and reopening a document. They use the extracted text only and never modify the PDF.
+- Each snapshot in the history also keeps its word list, about 24 bytes per word.
+
+The comparison is heuristic. It follows the order in which PDFKit extracts text, so reordered columns, moved floats and formulas whose extracted text changes can be marked. A word that differs only by a hyphen is not marked. A number that opens or ends a line apart from its text, as in some tables, is treated as a line number, and a line that repeats at the top or bottom of three or more pages as a header or footer. Where PDFKit glues a margin number to the last word of a line, the highlight leaves out that word's last letter, whose position PDFKit misreports.
 
 ## Jump points
 

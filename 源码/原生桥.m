@@ -12,15 +12,19 @@ static NSString *Normalize(NSString *s) {
 }
 static NSString *Digest(NSData *d) { unsigned char out[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes,(CC_LONG)d.length,out); NSMutableString *s=[NSMutableString new]; for(int i=0;i<sizeof(out);i++) [s appendFormat:@"%02x",out[i]]; return s; }
 #import "文本范围.h"
-static NSArray *Lines(PDFDocument *doc, NSUInteger *skipped) {
+#import "差异.h"
+static NSArray *Lines(PDFDocument *doc, NSUInteger *skipped, DiffWords *words) {
     NSMutableArray *out=[NSMutableArray new];
     for(NSUInteger p=0;p<doc.pageCount;p++) {
-        PDFPage *page=[doc pageAtIndex:p];
+        PDFPage *page=[doc pageAtIndex:p];NSString *content=page.string?:@"";
         PDFSelection *all=[page selectionForRange:NSMakeRange(0,page.numberOfCharacters)];
         for(PDFSelection *line in all.selectionsByLine) {
             if(!ValidTextRanges(line,page)){(*skipped)++;continue;}
+            NSRect rect=[line boundsForPage:page];
+            // 文言：取词有失，止其较文，不碍观卷。汉语：取词出现异常时只放弃这一版本的差异提示，不影响加载。
+            @try{[words addLine:line page:page index:p text:content y:NSMinY(rect)];}@catch(NSException *exception){words.failed=YES;}
             NSString *text=Normalize(line.string); if(!text.length) continue;
-            [out addObject:@{@"text":text,@"page":@(p),@"rect":NSStringFromRect([line boundsForPage:page]),@"label":page.label?:@""}];
+            [out addObject:@{@"text":text,@"page":@(p),@"rect":NSStringFromRect(rect),@"label":page.label?:@""}];
         }
     }
     return out;
@@ -29,7 +33,8 @@ static NSArray *Lines(PDFDocument *doc, NSUInteger *skipped) {
 static Viewer *V, *AppDelegate;
 static NSMutableArray<Viewer *> *Windows;
 static BOOL Quitting;
-static NSMutableDictionary *Histories;
+static NSMutableDictionary *Histories,*DiffCache;
+static BOOL DiffHints=YES;
 static NSUInteger WindowSerial, PollIndex;
 static Viewer *OpenWindow(NSString *path);
 static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY_VIEWER_BACKGROUND"] isEqual:@"1"]; }
@@ -63,6 +68,10 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 @property NSMenu *versionsMenu;
 @property NSButton *previousVersionButton,*nextVersionButton,*latestVersionButton;
 @property NSArray *lines,*candidateLines,*anchors;
+@property NSData *candidateWords;
+@property NSArray<PDFSelection *> *addedSelections,*deletedSelections;
+@property NSUInteger addedWords,deletedWords;
+@property NSMenuItem *diffItem;
 @property PDFDocument *candidate;
 @property NSString *candidateDigest;
 @property NSMutableArray *events;
@@ -134,6 +143,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     [self item:@"Next Page" action:@selector(next:) key:@"]" menu:view];
     [self item:@"Single Page / Continuous" action:@selector(mode:) key:@"" menu:view];
     [self item:@"Follow Edits" action:@selector(follow:) key:@"" menu:view];
+    self.diffItem=[self item:@"Highlight Changes" action:@selector(toggleDiff:) key:@"" menu:view];self.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;
     self.jumpPoints=[NSMutableArray new];
     self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
     [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
@@ -213,10 +223,10 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     dispatch_source_set_event_handler(self.fileWatch,^{if(session==self.session){[self armFileWatch];if(![self.events.lastObject[@"kind"] isEqual:@2])[self enqueue:2 generation:0];}});
     dispatch_source_set_cancel_handler(self.fileWatch,^{close(fd);});dispatch_resume(self.fileWatch);self.watchCount++;
 }
-- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;self.pdf.document=nil;[self rebuildSearch];self.lines=@[];[self clearCandidate];self.history=nil;self.versionIndex=-1;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self refreshVersionControls];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
+- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;self.pdf.document=nil;[self rebuildDiff];[self rebuildSearch];self.lines=@[];[self clearCandidate];self.history=nil;self.versionIndex=-1;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self refreshVersionControls];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
 - (void)openPath:(NSString *)path {
     [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;
-    self.pdf.document=nil;[self rebuildSearch];self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
+    self.pdf.document=nil;[self rebuildDiff];[self rebuildSearch];self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
     self.history=self.histories[self.path];if(!self.history){self.history=[NSMutableArray new];self.histories[self.path]=self.history;}self.versionIndex=-1;
     self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
@@ -243,7 +253,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     NSArray *matches=self.searchQuery.length&&self.pdf.document?[self.pdf.document findString:self.searchQuery withOptions:NSCaseInsensitiveSearch]:@[];
     NSMutableArray *valid=[NSMutableArray new];for(PDFSelection *match in matches)if(ValidSelection(match))[valid addObject:match];self.searchMatches=valid;
     for(PDFSelection *match in self.searchMatches)match.color=[NSColor.systemYellowColor colorWithAlphaComponent:.45];
-    self.pdf.highlightedSelections=self.searchMatches;
+    [self applyHighlights];
     self.previousSearchButton.enabled=self.searchMatches.count>0;self.nextSearchButton.enabled=self.searchMatches.count>0;
     self.previousSearchButton.toolTip=@"Previous search match (⇧⌘G)";self.nextSearchButton.toolTip=@"Next search match (⌘G)";
     self.search.toolTip=self.searchQuery.length?[NSString stringWithFormat:@"%lu matches",self.searchMatches.count]:@"Find in PDF";
@@ -270,15 +280,15 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
         struct stat before,after;BOOL exists=stat(path.fileSystemRepresentation,&before)==0;
         NSData *data=exists?[NSData dataWithContentsOfFile:path options:0 error:nil]:nil;
         BOOL stable=stat(path.fileSystemRepresentation,&after)==0 && exists && before.st_ino==after.st_ino && before.st_size==after.st_size && before.st_mtimespec.tv_sec==after.st_mtimespec.tv_sec && before.st_mtimespec.tv_nsec==after.st_mtimespec.tv_nsec;
-        NSString *hash=data?Digest(data):@"";PDFDocument *doc=nil;NSArray *lines=@[];NSUInteger skipped=0;
+        NSString *hash=data?Digest(data):@"";PDFDocument *doc=nil;NSArray *lines=@[];NSUInteger skipped=0;DiffWords *words=[DiffWords new];NSData *tokens=nil;
         if(stable&&data.length>10){NSData *tail=[data subdataWithRange:NSMakeRange(data.length>4096?data.length-4096:0,MIN(data.length,4096))];NSString *end=[[NSString alloc]initWithData:tail encoding:NSISOLatin1StringEncoding];
             if([[end stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] hasSuffix:@"%%EOF"]){doc=[[PDFDocument alloc]initWithData:data];if(!doc.pageCount||doc.isLocked)doc=nil;}
             if(doc){for(NSUInteger p=0;p<doc.pageCount;p++){if(![doc pageAtIndex:p].pageRef){doc=nil;break;}}}
-            if(doc)lines=Lines(doc,&skipped);
+            if(doc){lines=Lines(doc,&skipped,words);@try{tokens=[words finish];}@catch(NSException *exception){tokens=nil;}}
         }
         if(delay>0)[NSThread sleepForTimeInterval:delay];
         dispatch_async(dispatch_get_main_queue(),^{if(session!=self.session)return;
-            if(doc){[self.events addObject:@{@"kind":@3,@"generation":@(generation),@"doc":doc,@"lines":lines,@"digest":hash,@"data":data,@"skipped":@(skipped)}];}
+            if(doc){[self.events addObject:@{@"kind":@3,@"generation":@(generation),@"doc":doc,@"lines":lines,@"digest":hash,@"data":data,@"skipped":@(skipped),@"words":tokens?:[NSData data]}];}
             else [self enqueue:4 generation:generation];
         });
     }});
@@ -314,29 +324,70 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 - (NSString *)updatedStatus {
     NSString *prefix=self.versionIndex<(NSInteger)self.history.count-1?[NSString stringWithFormat:@"Viewing version %ld/%lu · ",(long)self.versionIndex+1,self.history.count]:@"";
     NSString *version=prefix.length?@"":[NSString stringWithFormat:@" · Version %ld/%lu",(long)self.versionIndex+1,self.history.count];
-    return [NSString stringWithFormat:@"%@Updated at %@%@ · %lu pages · %@",prefix,[self dateText:self.lastUpdated],version,self.pdf.document.pageCount,self.path?:@""];
+    NSString *changes=[NSString stringWithFormat:@"%@%@",self.addedWords?[NSString stringWithFormat:@" +%lu",self.addedWords]:@"",self.deletedWords?[NSString stringWithFormat:@" −%lu",self.deletedWords]:@""];
+    if(changes.length)changes=[@" ·" stringByAppendingString:changes];
+    return [NSString stringWithFormat:@"%@Updated at %@%@%@ · %lu pages · %@",prefix,[self dateText:self.lastUpdated],version,changes,self.pdf.document.pageCount,self.path?:@""];
 }
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
     if(!self.candidate)return;
     BOOL initial=self.pdf.document==nil;self.pdf.document=self.candidate;self.lines=self.candidateLines;self.digest=self.candidateDigest;self.lastUpdated=self.candidateTime;self.versionIndex=self.candidateVersionIndex;self.skippedTextLines=self.candidateSkippedTextLines;[self clearCandidate];self.commits++;
     self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
     if(!initial){if(line>=0&&line<self.lines.count){NSDictionary *l=self.lines[line];NSPoint off=anchor>=0&&anchor<self.anchors.count?NSPointFromString(self.anchors[anchor][@"offset"]):self.fallbackOffset;[self positionPage:[l[@"page"] integerValue] point:NSRectFromString(l[@"rect"]).origin offset:off];}else [self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
-    self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
+    [self rebuildDiff];self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
     [self refreshJumpMenus];[self refreshVersionControls];[self rebuildSearch];
     [self navigate];
 }
 
+// 文言：增者染绿，将删者染红；可于菜单止之。汉语：所览版本相对前一版新增的词为绿底，下一版将删去的词为红底；View → Highlight Changes 可关闭，默认开启并记住选择。
+- (NSDictionary *)diffFrom:(NSDictionary *)old to:(NSDictionary *)new {
+    if(![old[@"words"] length]||![new[@"words"] length])return nil;
+    NSString *key=[NSString stringWithFormat:@"%@>%@",old[@"digest"],new[@"digest"]];
+    NSDictionary *diff=DiffCache[key];if(!diff){diff=DiffCompute(old[@"words"],new[@"words"],old[@"doc"],new[@"doc"]);DiffCache[key]=diff;}
+    return diff;
+}
+// 文言：邻版文同者越之，较于文异之最近者。汉语：重编译而一词未改的版本（只有行号、分页或 PDF 元数据不同）不作为比较对象，
+// 否则一次没有改动的构建会让上一处修改的提示消失。step 为 -1 时找此前最近的有词改动的版本，为 1 时找此后最近的。
+- (NSDictionary *)changeAt:(NSInteger)index step:(NSInteger)step {
+    for(NSInteger other=index+step;other>=0&&other<(NSInteger)self.history.count;other+=step){
+        NSDictionary *diff=step<0?[self diffFrom:self.history[other] to:self.history[index]]:[self diffFrom:self.history[index] to:self.history[other]];
+        if(!diff)return nil;
+        if([diff[@"added"] unsignedIntegerValue]||[diff[@"deleted"] unsignedIntegerValue])return diff;
+    }
+    return nil;
+}
+- (void)applyHighlights {
+    NSMutableArray *all=[NSMutableArray arrayWithArray:self.addedSelections?:@[]];[all addObjectsFromArray:self.deletedSelections?:@[]];[all addObjectsFromArray:self.searchMatches?:@[]];
+    self.pdf.highlightedSelections=all;
+}
+- (void)rebuildDiff {
+    self.addedSelections=@[];self.deletedSelections=@[];self.addedWords=0;self.deletedWords=0;
+    NSInteger index=self.versionIndex,count=self.history.count;PDFDocument *document=self.pdf.document;
+    if(DiffHints&&document&&index>=0&&index<count&&self.history[index][@"doc"]==document){
+        @try{
+            NSDictionary *current=self.history[index],*diff=[self changeAt:index step:-1];
+            if(diff){self.addedWords=[diff[@"added"] unsignedIntegerValue];self.addedSelections=DiffSelections(document,current[@"words"],diff[@"new"],[NSColor.systemGreenColor colorWithAlphaComponent:.35]);}
+            diff=[self changeAt:index step:1];
+            if(diff){self.deletedWords=[diff[@"deleted"] unsignedIntegerValue];self.deletedSelections=DiffSelections(document,current[@"words"],diff[@"old"],[NSColor.systemRedColor colorWithAlphaComponent:.35]);}
+        }@catch(NSException *exception){self.addedSelections=@[];self.deletedSelections=@[];self.addedWords=0;self.deletedWords=0;}
+    }
+    [self applyHighlights];
+}
+- (void)toggleDiff:(id)sender {
+    DiffHints=!DiffHints;if(!Background())[NSUserDefaults.standardUserDefaults setBool:DiffHints forKey:@"HighlightChanges"];
+    for(Viewer *viewer in Windows){viewer.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;[viewer rebuildDiff];if(viewer.pdf.document)viewer.status.stringValue=[viewer updatedStatus];}
+}
+
 // 文言：诸成卷皆藏内存，换览不覆原卷。汉语：保留每次成功加载的内容变更；不淘汰旧快照，不写回 PDF。
-- (void)clearCandidate {self.candidate=nil;self.candidateLines=nil;self.candidateDigest=nil;self.candidateData=nil;self.candidateTime=nil;self.candidateVersionIndex=-1;self.candidateSkippedTextLines=0;}
+- (void)clearCandidate {self.candidate=nil;self.candidateLines=nil;self.candidateWords=nil;self.candidateDigest=nil;self.candidateData=nil;self.candidateTime=nil;self.candidateVersionIndex=-1;self.candidateSkippedTextLines=0;}
 - (void)recordVersion {
     if(!self.candidate||!self.candidateData)return;
     self.candidateTime=[NSDate date];self.candidateVersionIndex=self.history.count;
-    [self.history addObject:@{@"doc":self.candidate,@"lines":self.candidateLines,@"digest":self.candidateDigest,@"time":self.candidateTime,@"data":self.candidateData,@"skipped":@(self.candidateSkippedTextLines)}];
+    [self.history addObject:@{@"doc":self.candidate,@"lines":self.candidateLines,@"digest":self.candidateDigest,@"time":self.candidateTime,@"data":self.candidateData,@"skipped":@(self.candidateSkippedTextLines),@"words":self.candidateWords?:[NSData data]}];
 }
-- (void)retainHistoricalView {[self clearCandidate];self.status.stringValue=[self updatedStatus];[self refreshVersionControls];[self navigate];}
+- (void)retainHistoricalView {[self clearCandidate];[self rebuildDiff];self.status.stringValue=[self updatedStatus];[self refreshVersionControls];[self navigate];}
 - (BOOL)prepareVersion:(NSInteger)index {
     if(index<0||index>=self.history.count||index==self.versionIndex)return NO;
-    NSDictionary *snapshot=self.history[index];self.candidate=snapshot[@"doc"];self.candidateLines=snapshot[@"lines"];self.candidateDigest=snapshot[@"digest"];self.candidateData=snapshot[@"data"];self.candidateTime=snapshot[@"time"];self.candidateVersionIndex=index;self.candidateSkippedTextLines=[snapshot[@"skipped"] unsignedIntegerValue];return YES;
+    NSDictionary *snapshot=self.history[index];self.candidate=snapshot[@"doc"];self.candidateLines=snapshot[@"lines"];self.candidateWords=snapshot[@"words"];self.candidateDigest=snapshot[@"digest"];self.candidateData=snapshot[@"data"];self.candidateTime=snapshot[@"time"];self.candidateVersionIndex=index;self.candidateSkippedTextLines=[snapshot[@"skipped"] unsignedIntegerValue];return YES;
 }
 - (void)previousVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@(-1)}];}
 - (void)nextVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@1}];}
@@ -547,7 +598,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
             if(self.fileSignature&&![self.fileSignature isEqual:signature])[self enqueue:2 generation:0];self.fileSignature=signature;
         }
         if(!self.events.count)return @0;self.event=self.events[0];[self.events removeObjectAtIndex:0];
-        if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateDigest=self.event[@"digest"];self.candidateData=self.event[@"data"];self.candidateTime=nil;self.candidateVersionIndex=-1;self.candidateSkippedTextLines=[self.event[@"skipped"] unsignedIntegerValue];}
+        if([self.event[@"kind"] isEqual:@3]){self.candidate=self.event[@"doc"];self.candidateLines=self.event[@"lines"];self.candidateWords=self.event[@"words"];self.candidateDigest=self.event[@"digest"];self.candidateData=self.event[@"data"];self.candidateTime=nil;self.candidateVersionIndex=-1;self.candidateSkippedTextLines=[self.event[@"skipped"] unsignedIntegerValue];}
         return self.event[@"kind"];
     }}
     if([op isEqual:@"saveScheduler"]){self.scheduler=[a copy];return @0;}
@@ -583,7 +634,13 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     if([op isEqual:@"inspectToolbar"]){NSMutableArray *frames=[NSMutableArray new];NSMutableArray *controls=[self.baseButtons mutableCopy];[controls addObjectsFromArray:@[self.pageField,self.setJumpButton,self.search,self.previousSearchButton,self.nextSearchButton]];if(self.history.count>1)[controls addObjectsFromArray:@[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]];for(NSView *view in controls)[frames addObject:NSStringFromRect(view.frame)];return @{@"overflow":@(self.toolbarOverflow),@"frames":frames,@"bounds":NSStringFromRect(self.window.contentView.bounds),@"pdf":NSStringFromRect(self.pdf.frame),@"scrollHeight":@(self.jumpBar.contentSize.height),@"scrollX":@(self.jumpBar.contentView.bounds.origin.x),@"pointHeight":@(self.jumpBar.documentView.subviews.firstObject.frame.size.height),@"searchWidth":@(self.search.frame.size.width)};}
     if([op isEqual:@"testSearch"]){self.search.stringValue=a[0];[self controlTextDidChange:[NSNotification notificationWithName:NSControlTextDidChangeNotification object:self.search]];return @0;}
     if([op isEqual:@"testSearchStep"]){if([a[0] integerValue]<0)[self.previousSearchButton performClick:nil];else [self.nextSearchButton performClick:nil];return @0;}
-    if([op isEqual:@"inspectSearch"]){NSMutableArray *pages=[NSMutableArray new];for(PDFSelection *match in self.pdf.highlightedSelections)[pages addObject:@([self.pdf.document indexForPage:match.pages.firstObject])];return @{@"query":self.searchQuery?:@"",@"count":@(self.searchMatches.count),@"highlighted":@(self.pdf.highlightedSelections.count),@"index":@(self.searchIndex),@"pages":pages,@"selection":self.pdf.currentSelection.string?:@"",@"previousEnabled":@(self.previousSearchButton.enabled),@"nextEnabled":@(self.nextSearchButton.enabled),@"previousY":@(self.previousSearchButton.frame.origin.y),@"nextY":@(self.nextSearchButton.frame.origin.y),@"searchY":@(self.search.frame.origin.y),@"tooltip":self.search.toolTip?:@""};}
+    if([op isEqual:@"testDiff"]){if(DiffHints!=[a[0] boolValue])[self toggleDiff:nil];return @0;}
+    if([op isEqual:@"testDiffMenu"]){[NSApp sendAction:self.diffItem.action to:self.diffItem.target from:self.diffItem];return @0;}
+    if([op isEqual:@"inspectDiff"]){NSMutableArray *texts=[NSMutableArray new];NSUInteger shown=0;
+        for(NSArray *group in @[self.addedSelections?:@[],self.deletedSelections?:@[]]){NSMutableArray *list=[NSMutableArray new];[texts addObject:list];
+            for(PDFSelection *selection in group){if([self.pdf.highlightedSelections indexOfObjectIdenticalTo:selection]!=NSNotFound)shown++;[list addObject:@{@"text":selection.string?:@"",@"page":@([self.pdf.document indexForPage:selection.pages.firstObject])}];}}
+        return @{@"enabled":@(DiffHints),@"menu":@(self.diffItem.state==NSControlStateValueOn),@"added":texts[0],@"deleted":texts[1],@"addedWords":@(self.addedWords),@"deletedWords":@(self.deletedWords),@"shown":@(shown)};}
+    if([op isEqual:@"inspectSearch"]){NSMutableArray *pages=[NSMutableArray new];for(PDFSelection *match in self.pdf.highlightedSelections)if([self.searchMatches indexOfObjectIdenticalTo:match]!=NSNotFound)[pages addObject:@([self.pdf.document indexForPage:match.pages.firstObject])];return @{@"query":self.searchQuery?:@"",@"count":@(self.searchMatches.count),@"highlighted":@(pages.count),@"index":@(self.searchIndex),@"pages":pages,@"selection":self.pdf.currentSelection.string?:@"",@"previousEnabled":@(self.previousSearchButton.enabled),@"nextEnabled":@(self.nextSearchButton.enabled),@"previousY":@(self.previousSearchButton.frame.origin.y),@"nextY":@(self.nextSearchButton.frame.origin.y),@"searchY":@(self.search.frame.origin.y),@"tooltip":self.search.toolTip?:@""};}
     if([op isEqual:@"testWindowShortcut"]){self.cycleDestination=nil;NSEventModifierFlags flags=NSEventModifierFlagCommand|([a[0] boolValue]?NSEventModifierFlagShift:0);NSEvent *event=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0 windowNumber:self.window.windowNumber context:nil characters:[a[0] boolValue]?@"~":@"`" charactersIgnoringModifiers:[a[0] boolValue]?@"~":@"`" isARepeat:NO keyCode:50];BOOL handled=[self.menuBar performKeyEquivalent:event];return @{@"handled":@(handled),@"target":self.cycleDestination?:@0};}
     if([op isEqual:@"inspectUI"]){NSMutableArray *buttons=[NSMutableArray new];for(NSButton *button in self.jumpBar.documentView.subviews){NSMutableArray *actions=[NSMutableArray new];for(NSMenuItem *item in button.menu.itemArray)[actions addObject:item.title];[buttons addObject:@{@"title":button.title,@"actions":actions}];}return @{@"buttons":buttons,@"active":@(NSApp.active),@"visible":@(self.window.visible),@"canBecomeKey":@(self.window.canBecomeKeyWindow),@"canBecomeMain":@(self.window.canBecomeMainWindow),@"pointY":@(self.jumpBar.frame.origin.y),@"setY":@(self.setJumpButton.frame.origin.y),@"historyY":@(self.previousVersionButton.frame.origin.y),@"searchY":@(self.search.frame.origin.y)};}
     if([op isEqual:@"inspectJumps"])return self.jumpPoints?:@[];
@@ -608,7 +665,9 @@ static Viewer *OpenWindow(NSString *path) {
     if(normalized.length)[viewer openPath:normalized];if(!Background()){if(viewer.window.miniaturized)[viewer.window deminiaturize:nil];[viewer.window makeKeyAndOrderFront:nil];}return viewer;
 }
 static id Dispatch(NSString *op,NSArray *args) {
-    if(!Windows){Windows=[NSMutableArray new];Histories=[NSMutableDictionary new];}
+    if(!Windows){Windows=[NSMutableArray new];Histories=[NSMutableDictionary new];DiffCache=[NSMutableDictionary new];
+        // 文言：验时恒启，不读不写其好。汉语：后台测试模式固定开启且不读写用户偏好；正常运行时默认开启并记住选择。
+        DiffHints=Background()||![NSUserDefaults.standardUserDefaults objectForKey:@"HighlightChanges"]||[NSUserDefaults.standardUserDefaults boolForKey:@"HighlightChanges"];}
     if([op isEqual:@"init"]){V=OpenWindow(args.count?args[0]:nil);return @0;}
     if([op isEqual:@"openNew"])return OpenWindow(args.count?args[0]:nil).windowID;
     if([op isEqual:@"inspectWindows"]){NSMutableArray *out=[NSMutableArray new];for(Viewer *viewer in Windows)[out addObject:@{@"id":viewer.windowID,@"path":viewer.path?:@""}];return out;}

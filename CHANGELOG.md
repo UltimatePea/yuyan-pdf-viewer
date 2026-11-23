@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.7 — 2026-11-23
+
+- Highlight changes between consecutive PDF versions. Words added since the previous version have a green background. While viewing an older version, words that the next version deletes have a red background. The status bar shows the word counts, such as `+72 −147`.
+- Turn the highlights off or on with **View → Highlight Changes**. They are on by default, apply to every window, and the choice persists across launches.
+- Compare words instead of lines, so that layout changes are not reported: margin line numbers and page numbers, running headers and footers, rebroken lines, and words re-hyphenated at a line end.
+- Do not mark text that only moved to another page, or that PDFKit reports in another order while it stands in the same place, as happens to tables, inference rules and proof steps when a page break or a margin number changes. Text that really moved within a page is still marked.
+- Pass over rebuilds that change no words: each version is compared with the nearest earlier and later version whose words differ, so a rebuild without edits keeps the highlights of the last change.
+- Recognise margin line numbers however PDFKit reports them: on a line of their own, at the head of the text line, or glued to its last word.
+- Show change highlights together with search highlights, and rebuild them after refreshes, version changes and reopening a document.
+
 ## v0.2.6 — 2026-10-04
 
 - Let history and jump points overflow to a second toolbar row when the window is too narrow to keep every control readable. Return to one row automatically when there is enough room.

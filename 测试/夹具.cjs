@@ -7,4 +7,12 @@ function pdf(pages,{image=false,revision=''}={}){
  objs[2]=`<< /Type /Pages /Count ${pages.length} /Kids [${kids.join(' ')}] >>`;let text='%PDF-1.4\n',offsets=[0];for(let i=1;i<objs.length;i++){offsets.push(Buffer.byteLength(text));text+=`${i} 0 obj\n${objs[i]}\nendobj\n`;}
  let x=Buffer.byteLength(text);text+=`xref\n0 ${objs.length}\n0000000000 65535 f \n`+offsets.slice(1).map(n=>`${String(n).padStart(10,'0')} 00000 n \n`).join('')+`trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${x}\n%%EOF\n`;return Buffer.from(text);
 }
-module.exports={pdf};
+// 文言：逐行置文，可设行号、页眉与页脚。汉语：按坐标逐行排版；每页为若干 [x, y, 字号, 文本]。
+function layout(pages){
+ let objs=['','<< /Type /Catalog /Pages 2 0 R >>','', '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'],kids=[];
+ pages.forEach(lines=>{const index=objs.length;kids.push(index+' 0 R');objs.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${index+1} 0 R >>`);
+ let data=lines.map(([x,y,size,text])=>`BT /F1 ${size} Tf ${x} ${y} Td (${text.replace(/[\\()]/g,'\\$&')}) Tj ET`).join('\n');objs.push(`<< /Length ${Buffer.byteLength(data)} >>\nstream\n${data}\nendstream`);});
+ objs[2]=`<< /Type /Pages /Count ${pages.length} /Kids [${kids.join(' ')}] >>`;let text='%PDF-1.4\n',offsets=[0];for(let i=1;i<objs.length;i++){offsets.push(Buffer.byteLength(text));text+=`${i} 0 obj\n${objs[i]}\nendobj\n`;}
+ let x=Buffer.byteLength(text);text+=`xref\n0 ${objs.length}\n0000000000 65535 f \n`+offsets.slice(1).map(n=>`${String(n).padStart(10,'0')} 00000 n \n`).join('')+`trailer\n<< /Size ${objs.length} /Root 1 0 R >>\nstartxref\n${x}\n%%EOF\n`;return Buffer.from(text);
+}
+module.exports={pdf,layout};
