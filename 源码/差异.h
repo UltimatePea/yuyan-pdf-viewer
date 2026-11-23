@@ -7,6 +7,7 @@
 // 在多页同一位置重复出现的页眉页脚不参与比较；仅因分页而换页的文字不算改动。只使用已验证的文本范围，从不读取 PDFSelection.string。
 // 文言：词记其页、其位、其行之高下。汉语：每个词 24 字节：散列、页、字符范围，以及所在行的上缘（页坐标）和行高（八分之一点）。
 // 行的上下位置用于概览条和逐处跳转，不必再向 PDFKit 询问每个范围的位置。
+// 词表原样存入版本库：改动这个结构、散列或取词规则时，须将 原生桥.m 的 StoreFormat 加一，使旧的缓存作废重取。
 typedef struct {uint64_t key;uint32_t loc;uint16_t page,len;float top;uint16_t tall,flags;} DiffToken;
 // Ignored: a margin number. Joined: the rest of the word before it. Tail, Head: the last or first character sits beside a
 // margin number that PDFKit glued to the word, and PDFKit reports that one character stretched across the line.

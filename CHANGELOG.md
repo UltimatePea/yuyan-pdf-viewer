@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.9 — 2026-11-23
+
+- Store every version on disk, in `~/Library/Application Support/YuyanPDFViewer/Versions/`, so that the history and its change highlights are still there after the app is quit and reopened. A reopened PDF shows its latest stored version at once; older versions are read only when they are shown or compared.
+- Add **Versions → Remove This Version**, **Remove Version** (a list of every version) and **Remove Earlier Versions…**. Once a version is removed, its neighbours are compared with each other, so removing a build that holds an unwanted edit leaves only the real difference highlighted. Removed versions are deleted from disk, and the last remaining version cannot be removed.
+- Ask for confirmation before removing, because a removed version cannot be restored. The confirmation for a single version has a **Do not ask again** box; **Remove Earlier Versions…** always asks.
+- Show at the end of the **Versions** menu how many versions of the document are stored and their size. Nothing is removed automatically.
+- Keep a version for the session when it cannot be written, and say `not saved to disk` in the status bar. Do not show a stored PDF whose bytes do not match its name. Rebuild missing or outdated line and word caches from the stored PDF.
+- Record version times in whole milliseconds, each later than the one before.
+
 ## v0.2.8 — 2026-11-23
 
 - Add an overview bar along the left edge of the window. It stands for the whole document, like a scrollbar with marks: green where the version adds words, red where the next version deletes them, and a grey block for the part in view. Click or drag on it to go there; click a mark to go to that change.

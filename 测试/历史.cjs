@@ -14,6 +14,7 @@ function* write(data){const count=versions().length;fs.writeFileSync(file,data);
 function* scenario(){
  yield* wait(()=>state().pages===3,'open');check(versions().length===1&&state().versionIndex===0,'initial PDF becomes version one');
  check(versions()[0].bytes===a.length&&versions()[0].digest===hash(a),'initial snapshot retains the exact PDF bytes');
+ check(!api('inspectStore').enabled&&!versions()[0].stored&&!state().status.includes('not saved'),'background tests never touch the version store unless a directory is given');
  api('testPosition',[2,1.3,500]);const anchor=state().anchor.text,firstTime=state().lastUpdatedMs;
  yield* write(b);check(versions().length===2&&state().versionIndex===1&&state().pages===4,'successful refresh adds and displays the next version');
  api('addJump',['Gamma']);yield* wait(()=>api('inspectJumps').length===1,'bookmark');const point=api('inspectJumps')[0],savedPoint=JSON.stringify(point);

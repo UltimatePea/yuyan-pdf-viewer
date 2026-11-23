@@ -34,10 +34,44 @@ static Viewer *V, *AppDelegate;
 static NSMutableArray<Viewer *> *Windows;
 static BOOL Quitting;
 static NSMutableDictionary *Histories,*DiffCache;
-static BOOL DiffHints=YES;
+static BOOL DiffHints=YES,RemoveAsks=YES;
 static NSUInteger WindowSerial, PollIndex;
 static Viewer *OpenWindow(NSString *path);
 static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY_VIEWER_BACKGROUND"] isEqual:@"1"]; }
+// 文言：诸版存于私库，退而复启犹在。汉语：版本库。每份 PDF 一个文件夹（以路径的散列为名），每个版本一个 PDF 文件，文件名是毫秒时间戳加内容散列，
+// 按文件名排序即时间顺序，不另设索引，删除版本就是删除文件。同名的 .words 与 .lines 是取词、取行结果的缓存（LZFSE 压缩），
+// 缺失、损坏、格式号不符或系统版本不同（PDFKit 的取文结果可能随系统变化）时，从 PDF 重新提取并重写。
+// 取行或取词的结果有变时须将 StoreFormat 加一。后台测试模式下只有设置了 YY_VERSIONS_DIRECTORY 才启用，绝不触碰用户的版本库。
+static const NSInteger StoreFormat=1;
+static NSArray<NSString *> *StoreParts(void) {return @[@"pdf",@"words",@"lines"];}
+static NSString *StoreBase(void) {
+    NSString *base=NSProcessInfo.processInfo.environment[@"YY_VERSIONS_DIRECTORY"];
+    if(base.length)return base.stringByStandardizingPath;
+    if(Background())return nil;
+    return [[[NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask] firstObject].path stringByAppendingPathComponent:@"YuyanPDFViewer/Versions"];
+}
+static BOOL StoreWrite(NSString *file,NSDictionary *content) {
+    NSMutableDictionary *all=[content mutableCopy];all[@"format"]=@(StoreFormat);all[@"system"]=NSProcessInfo.processInfo.operatingSystemVersionString;
+    // 文言：行表以 JSON 书之，速而小；词表含原始字节，以属性列表书之。汉语：一份两百页文稿的行表，JSON 比二进制属性列表写得快两倍，
+    // 压缩后小三分之一。含原始字节的词表，或文本里有孤立代理项而不能写成 JSON 的行表，用二进制属性列表。
+    NSData *plain=nil;
+    if([NSJSONSerialization isValidJSONObject:all]){@try{plain=[NSJSONSerialization dataWithJSONObject:all options:0 error:nil];}@catch(NSException *exception){plain=nil;}}
+    if(!plain)plain=[NSPropertyListSerialization dataWithPropertyList:all format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+    NSData *packed=[plain compressedDataUsingAlgorithm:NSDataCompressionAlgorithmLZFSE error:nil];
+    return packed.length&&[packed writeToFile:file options:NSDataWritingAtomic error:nil];
+}
+static NSDictionary *StoreRead(NSString *file) {
+    NSData *packed=file?[NSData dataWithContentsOfFile:file]:nil,*plain=packed.length?[packed decompressedDataUsingAlgorithm:NSDataCompressionAlgorithmLZFSE error:nil]:nil;
+    BOOL plist=plain.length>=6&&!memcmp(plain.bytes,"bplist",6);
+    id content=!plain.length?nil:plist?[NSPropertyListSerialization propertyListWithData:plain options:NSPropertyListImmutable format:nil error:nil]:[NSJSONSerialization JSONObjectWithData:plain options:0 error:nil];
+    if(![content isKindOfClass:NSDictionary.class])return nil;
+    return [content[@"format"] isEqual:@(StoreFormat)]&&[content[@"system"] isEqual:NSProcessInfo.processInfo.operatingSystemVersionString]?content:nil;
+}
+static void StoreMeasure(NSMutableDictionary *snapshot) {
+    unsigned long long total=0;NSString *stem=snapshot[@"stem"];
+    if(stem)for(NSString *part in StoreParts())total+=[[NSFileManager.defaultManager attributesOfItemAtPath:[stem stringByAppendingPathExtension:part] error:nil] fileSize];
+    snapshot[@"disk"]=@(total);
+}
 @interface ViewerWindow : NSWindow @end
 @implementation ViewerWindow
 - (BOOL)canBecomeKeyWindow {return !Background()&&[super canBecomeKeyWindow];}
@@ -100,6 +134,8 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 @property NSData *candidateData;
 @property NSDate *candidateTime;
 @property NSMenu *versionsMenu;
+@property NSAlert *pendingAlert;
+@property (copy) void (^pendingAnswer)(NSModalResponse response);
 @property NSButton *previousVersionButton,*nextVersionButton,*latestVersionButton;
 @property NSArray *lines,*candidateLines,*anchors;
 @property NSData *candidateWords;
@@ -275,13 +311,14 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 - (void)openPath:(NSString *)path {
     [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;
     self.pdf.document=nil;[self rebuildDiff];[self rebuildSearch];self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
-    self.history=self.histories[self.path];if(!self.history){self.history=[NSMutableArray new];self.histories[self.path]=self.history;}self.versionIndex=-1;
+    self.history=self.histories[self.path];if(!self.history){self.history=[self storedHistory];self.histories[self.path]=self.history;}self.versionIndex=-1;
     self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
     self.status.stringValue=[@"Opening · " stringByAppendingString:self.path];
     self.fileSignature=nil;[self armDirectoryWatch];
     [self armFileWatch];
-    if(self.history.count){[self prepareVersion:(NSInteger)self.history.count-1];[self capture];[self commitLine:-1 anchor:0];}
+    // 文言：有旧版则先示其末，不待读卷。汉语：本次运行中开过，或版本库里存有此文档的版本，就立即显示最新的一版，随后照常读取磁盘上的文件。
+    if(self.history.count&&[self prepareVersion:(NSInteger)self.history.count-1]){[self capture];[self commitLine:-1 anchor:0];}
     [self refreshVersionControls];
     [self enqueue:1 generation:0];
 }
@@ -366,7 +403,9 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 }
 - (NSString *)dateText:(NSDate *)date {
     // 文言：记成卷之时，精确至秒；无变则不改其时。汉语：使用系统当地时间，保留最后成功更新的时间戳。
-    NSDateFormatter *format=[NSDateFormatter new];format.locale=[[NSLocale alloc]initWithLocaleIdentifier:@"en_US_POSIX"];format.calendar=[[NSCalendar alloc]initWithCalendarIdentifier:NSCalendarIdentifierGregorian];format.timeZone=NSTimeZone.localTimeZone;format.dateFormat=@"yyyy-MM-dd HH:mm:ss";
+    // 版本菜单逐项调用，存盘后版本可达数百，故只建一次。
+    static NSDateFormatter *format;
+    if(!format){format=[NSDateFormatter new];format.locale=[[NSLocale alloc]initWithLocaleIdentifier:@"en_US_POSIX"];format.calendar=[[NSCalendar alloc]initWithCalendarIdentifier:NSCalendarIdentifierGregorian];format.timeZone=NSTimeZone.localTimeZone;format.dateFormat=@"yyyy-MM-dd HH:mm:ss";}
     return date?[format stringFromDate:date]:@"—";
 }
 - (NSString *)updatedStatus {
@@ -375,6 +414,8 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     NSString *changes=[NSString stringWithFormat:@"%@%@",self.addedWords?[NSString stringWithFormat:@" +%lu",self.addedWords]:@"",self.deletedWords?[NSString stringWithFormat:@" −%lu",self.deletedWords]:@""];
     if(changes.length)changes=[@" ·" stringByAppendingString:changes];
     if(self.changeIndex>=0&&self.changeIndex<(NSInteger)self.changeSets.count)changes=[changes stringByAppendingFormat:@" · Change %ld/%lu",(long)self.changeIndex+1,self.changeSets.count];
+    // 版本库可用而此版未能写入（磁盘已满、无权限）时如实告知：它只在本次运行中保留。
+    if(StoreBase()&&self.versionIndex>=0&&self.versionIndex<(NSInteger)self.history.count&&!self.history[self.versionIndex][@"stem"])changes=[changes stringByAppendingString:@" · not saved to disk"];
     return [NSString stringWithFormat:@"%@Updated at %@%@%@ · %lu pages · %@",prefix,[self dateText:self.lastUpdated],version,changes,self.pdf.document.pageCount,self.path?:@""];
 }
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
@@ -388,10 +429,12 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 }
 
 // 文言：增者染绿，将删者染红；可于菜单止之。汉语：所览版本相对前一版新增的词为绿底，下一版将删去的词为红底；View → Highlight Changes 可关闭，默认开启并记住选择。
-- (NSDictionary *)diffFrom:(NSDictionary *)old to:(NSDictionary *)new {
-    if(![old[@"words"] length]||![new[@"words"] length])return nil;
+- (NSDictionary *)diffFrom:(NSMutableDictionary *)old to:(NSMutableDictionary *)new {
     NSString *key=[NSString stringWithFormat:@"%@>%@",old[@"digest"],new[@"digest"]];
-    NSDictionary *diff=DiffCache[key];if(!diff){diff=DiffCompute(old[@"words"],new[@"words"],old[@"doc"],new[@"doc"]);DiffCache[key]=diff;}
+    NSDictionary *diff=DiffCache[key];if(diff)return diff;
+    // 版本库里尚未读入的版本，此时才读其 PDF 与词表。
+    if(![self loadWords:old]||![self loadWords:new]||![old[@"words"] length]||![new[@"words"] length])return nil;
+    diff=DiffCompute(old[@"words"],new[@"words"],old[@"doc"],new[@"doc"]);DiffCache[key]=diff;
     return diff;
 }
 // 文言：邻版文同者越之，较于文异之最近者。汉语：重编译而一词未改的版本（只有行号、分页或 PDF 元数据不同）不作为比较对象，
@@ -511,18 +554,124 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     for(Viewer *viewer in Windows){viewer.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;[viewer rebuildDiff];[viewer layoutJumpControls];if(viewer.fit)[viewer fitWidth:nil];if(viewer.pdf.document)viewer.status.stringValue=[viewer updatedStatus];}
 }
 
-// 文言：诸成卷皆藏内存，换览不覆原卷。汉语：保留每次成功加载的内容变更；不淘汰旧快照，不写回 PDF。
+// 文言：诸成卷皆藏内存，亦存私库；换览不覆原卷。汉语：保留每次成功加载的内容变更并写入版本库；不自动淘汰旧快照，不写回 PDF。
+// 每个版本是一个可变字典：digest、time、bytes 恒有；doc、data、words、lines、skipped 对本次运行中读到的版本恒有，
+// 对版本库里的版本则在显示或比较时才读入（loadDocument、loadWords、loadFull 三级）；stem 是它在版本库里的文件名（不含扩展名），未能写入则无。
 - (void)clearCandidate {self.candidate=nil;self.candidateLines=nil;self.candidateWords=nil;self.candidateDigest=nil;self.candidateData=nil;self.candidateTime=nil;self.candidateVersionIndex=-1;self.candidateSkippedTextLines=0;}
+- (NSString *)storeFolder {NSString *base=self.path?StoreBase():nil;return base?[base stringByAppendingPathComponent:Digest([self.path dataUsingEncoding:NSUTF8StringEncoding])]:nil;}
+- (NSMutableArray *)storedHistory {
+    NSMutableArray *history=[NSMutableArray new];NSString *folder=[self storeFolder];if(!folder)return history;
+    NSRegularExpression *name=[NSRegularExpression regularExpressionWithPattern:@"^(\\d{14})-([0-9a-f]{64})\\.pdf$" options:0 error:nil];
+    for(NSString *file in [[NSFileManager.defaultManager contentsOfDirectoryAtPath:folder error:nil] sortedArrayUsingSelector:@selector(compare:)]){
+        NSTextCheckingResult *match=[name firstMatchInString:file options:0 range:NSMakeRange(0,file.length)];if(!match)continue;
+        unsigned long long bytes=[[NSFileManager.defaultManager attributesOfItemAtPath:[folder stringByAppendingPathComponent:file] error:nil] fileSize];if(!bytes)continue;
+        NSMutableDictionary *snapshot=[@{@"digest":[file substringWithRange:[match rangeAtIndex:2]],@"time":[NSDate dateWithTimeIntervalSince1970:[[file substringWithRange:[match rangeAtIndex:1]] longLongValue]/1000.0],@"bytes":@(bytes),@"stem":[folder stringByAppendingPathComponent:file.stringByDeletingPathExtension]} mutableCopy];
+        StoreMeasure(snapshot);[history addObject:snapshot];
+    }
+    return history;
+}
+- (void)storeText:(NSMutableDictionary *)snapshot {
+    NSString *stem=snapshot[@"stem"];if(!stem)return;
+    StoreWrite([stem stringByAppendingPathExtension:@"words"],@{@"token":@(sizeof(DiffToken)),@"words":snapshot[@"words"]?:[NSData data]});
+    StoreWrite([stem stringByAppendingPathExtension:@"lines"],@{@"skipped":snapshot[@"skipped"]?:@0,@"lines":snapshot[@"lines"]?:@[]});
+    StoreMeasure(snapshot);
+}
+- (void)storeSnapshot:(NSMutableDictionary *)snapshot {
+    NSString *folder=[self storeFolder];NSData *data=snapshot[@"data"];if(!folder||!data)return;
+    NSFileManager *files=NSFileManager.defaultManager;if(![files createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil])return;
+    NSString *note=[folder stringByAppendingPathComponent:@"source-path.txt"];if(![files fileExistsAtPath:note])[self.path writeToFile:note atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *stem=[folder stringByAppendingPathComponent:[NSString stringWithFormat:@"%014lld-%@",llround([snapshot[@"time"] timeIntervalSince1970]*1000),snapshot[@"digest"]]];
+    if(![data writeToFile:[stem stringByAppendingPathExtension:@"pdf"] options:NSDataWritingAtomic error:nil])return;
+    snapshot[@"stem"]=stem;[self storeText:snapshot];
+}
+- (void)unstore:(NSDictionary *)snapshot {NSString *stem=snapshot[@"stem"];if(stem)for(NSString *part in StoreParts())[NSFileManager.defaultManager removeItemAtPath:[stem stringByAppendingPathExtension:part] error:nil];}
+- (BOOL)loadDocument:(NSMutableDictionary *)snapshot {
+    if(snapshot[@"doc"])return YES;NSString *stem=snapshot[@"stem"];if(!stem)return NO;
+    NSData *data=[NSData dataWithContentsOfFile:[stem stringByAppendingPathExtension:@"pdf"]];if(!data||![Digest(data) isEqual:snapshot[@"digest"]])return NO;
+    PDFDocument *doc=[[PDFDocument alloc]initWithData:data];if(!doc.pageCount||doc.isLocked)return NO;
+    snapshot[@"data"]=data;snapshot[@"doc"]=doc;return YES;
+}
+- (void)extract:(NSMutableDictionary *)snapshot {
+    NSUInteger skipped=0;DiffWords *words=[DiffWords new];NSData *tokens=nil;NSArray *lines=Lines(snapshot[@"doc"],&skipped,words);
+    @try{tokens=[words finish];}@catch(NSException *exception){tokens=nil;}
+    snapshot[@"lines"]=lines;snapshot[@"words"]=tokens?:[NSData data];snapshot[@"skipped"]=@(skipped);[self storeText:snapshot];
+}
+- (BOOL)loadWords:(NSMutableDictionary *)snapshot {
+    if(snapshot[@"words"])return YES;if(![self loadDocument:snapshot])return NO;
+    NSDictionary *stored=StoreRead([snapshot[@"stem"] stringByAppendingPathExtension:@"words"]);NSData *words=stored[@"words"];
+    if([words isKindOfClass:NSData.class]&&[stored[@"token"] isEqual:@(sizeof(DiffToken))]&&words.length%sizeof(DiffToken)==0)snapshot[@"words"]=words;else [self extract:snapshot];
+    return YES;
+}
+- (BOOL)loadFull:(NSMutableDictionary *)snapshot {
+    if(snapshot[@"lines"])return YES;if(![self loadWords:snapshot])return NO;
+    NSDictionary *stored=StoreRead([snapshot[@"stem"] stringByAppendingPathExtension:@"lines"]);NSArray *lines=stored[@"lines"];NSUInteger pages=[snapshot[@"doc"] pageCount];
+    BOOL valid=[lines isKindOfClass:NSArray.class]&&[stored[@"skipped"] isKindOfClass:NSNumber.class];
+    if(valid)for(NSDictionary *line in lines)if(![line isKindOfClass:NSDictionary.class]||![line[@"text"] isKindOfClass:NSString.class]||![line[@"rect"] isKindOfClass:NSString.class]||![line[@"label"] isKindOfClass:NSString.class]||![line[@"page"] isKindOfClass:NSNumber.class]||[line[@"page"] unsignedIntegerValue]>=pages){valid=NO;break;}
+    if(valid){snapshot[@"lines"]=lines;snapshot[@"skipped"]=stored[@"skipped"];}else [self extract:snapshot];
+    return YES;
+}
 - (void)recordVersion {
     if(!self.candidate||!self.candidateData)return;
-    self.candidateTime=[NSDate date];self.candidateVersionIndex=self.history.count;
-    [self.history addObject:@{@"doc":self.candidate,@"lines":self.candidateLines,@"digest":self.candidateDigest,@"time":self.candidateTime,@"data":self.candidateData,@"skipped":@(self.candidateSkippedTextLines),@"words":self.candidateWords?:[NSData data]}];
+    // 文言：时以毫秒记，后者必晚于前。汉语：时间取整到毫秒并严格递增，与版本库的文件名一致，系统时钟回拨也不乱序。
+    long long now=llround(NSDate.date.timeIntervalSince1970*1000),last=self.history.count?llround([self.history.lastObject[@"time"] timeIntervalSince1970]*1000):0;
+    self.candidateTime=[NSDate dateWithTimeIntervalSince1970:MAX(now,last+1)/1000.0];self.candidateVersionIndex=self.history.count;
+    NSMutableDictionary *snapshot=[@{@"doc":self.candidate,@"lines":self.candidateLines,@"digest":self.candidateDigest,@"time":self.candidateTime,@"data":self.candidateData,@"bytes":@(self.candidateData.length),@"skipped":@(self.candidateSkippedTextLines),@"words":self.candidateWords?:[NSData data]} mutableCopy];
+    [self.history addObject:snapshot];[self storeSnapshot:snapshot];
 }
 - (void)retainHistoricalView {[self clearCandidate];[self rebuildDiff];self.status.stringValue=[self updatedStatus];[self refreshVersionControls];[self navigate];}
 - (BOOL)prepareVersion:(NSInteger)index {
     if(index<0||index>=self.history.count||index==self.versionIndex)return NO;
-    NSDictionary *snapshot=self.history[index];self.candidate=snapshot[@"doc"];self.candidateLines=snapshot[@"lines"];self.candidateWords=snapshot[@"words"];self.candidateDigest=snapshot[@"digest"];self.candidateData=snapshot[@"data"];self.candidateTime=snapshot[@"time"];self.candidateVersionIndex=index;self.candidateSkippedTextLines=[snapshot[@"skipped"] unsignedIntegerValue];return YES;
+    NSMutableDictionary *snapshot=self.history[index];
+    if(![self loadFull:snapshot]){self.status.stringValue=[NSString stringWithFormat:@"Version %ld cannot be read from disk · %@",(long)index+1,self.path?:@""];return NO;}
+    self.candidate=snapshot[@"doc"];self.candidateLines=snapshot[@"lines"];self.candidateWords=snapshot[@"words"];self.candidateDigest=snapshot[@"digest"];self.candidateData=snapshot[@"data"];self.candidateTime=snapshot[@"time"];self.candidateVersionIndex=index;self.candidateSkippedTextLines=[snapshot[@"skipped"] unsignedIntegerValue];return YES;
 }
+// 文言：去一版，则其前后二版相较。汉语：删除版本。删去中间的版本后，它前后的两个版本直接相比较，于是可以丢掉一次不想要的改动，只看真正的差别。
+// 不能删到一版不剩。正在显示的版本被删时，改为显示它之后最近的一版（没有就取之前的），经由正常的换版本流程，保持阅读位置。
+- (void)removeVersions:(NSIndexSet *)indexes {
+    NSInteger count=self.history.count,shown=self.versionIndex;
+    NSMutableIndexSet *set=[NSMutableIndexSet new];[indexes enumerateIndexesUsingBlock:^(NSUInteger index,BOOL *stop){if((NSInteger)index<count)[set addIndex:index];}];
+    if(!set.count||(NSInteger)set.count>=count)return;
+    NSMutableDictionary *next=nil;
+    if(shown>=0&&[set containsIndex:shown]){
+        for(NSInteger i=shown+1;i<count&&!next;i++)if(![set containsIndex:i]&&[self loadFull:self.history[i]])next=self.history[i];
+        for(NSInteger i=shown-1;i>=0&&!next;i--)if(![set containsIndex:i]&&[self loadFull:self.history[i]])next=self.history[i];
+        if(!next){self.status.stringValue=[NSString stringWithFormat:@"Cannot remove the version on screen: no other version can be read · %@",self.path?:@""];return;}
+    }
+    NSArray<NSDictionary *> *removed=[self.history objectsAtIndexes:set];[self.history removeObjectsAtIndexes:set];
+    for(NSDictionary *snapshot in removed)[self unstore:snapshot];
+    // 排队中的换版本请求所指的序号已不再对应原来的版本，弃之。
+    [self.events filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *event,NSDictionary *bindings){return ![event[@"kind"] isEqual:@7];}]];
+    if(next){self.versionIndex=-1;[self.events insertObject:@{@"kind":@7,@"historyIndex":@([self.history indexOfObjectIdenticalTo:next])} atIndex:0];return;}
+    if(shown>=0)self.versionIndex=shown-(NSInteger)[set countOfIndexesInRange:NSMakeRange(0,shown)];
+    [self rebuildDiff];if(self.pdf.document)self.status.stringValue=[self updatedStatus];[self refreshVersionControls];
+}
+// 文言：去版不可复，故先问之；可令勿复问。汉语：删除的版本不能恢复，执行前先确认。删除单个版本的确认框带“不再询问”，勾选后直接删除并记住选择；
+// 删除此前全部版本则每次都问。确认框开着的时候可能又有新版本到来，故记下版本本身而不是它们当时的序号。
+// 后台测试模式不显示确认框，而是留待测试钩子作答，其余路径与正常运行相同；也不读写用户的“不再询问”选择。
+- (void)askToRemove:(NSIndexSet *)indexes earlier:(BOOL)earlier {
+    NSInteger count=self.history.count;if(!indexes.count||indexes.lastIndex>=(NSUInteger)count||(NSInteger)indexes.count>=count)return;
+    NSArray<NSMutableDictionary *> *chosen=[self.history objectsAtIndexes:indexes];NSUInteger session=self.session;
+    void (^remove)(void)=^{
+        if(session!=self.session)return;NSMutableIndexSet *set=[NSMutableIndexSet new];
+        for(NSMutableDictionary *snapshot in chosen){NSUInteger index=[self.history indexOfObjectIdenticalTo:snapshot];if(index!=NSNotFound)[set addIndex:index];}
+        [self removeVersions:set];
+    };
+    if(!earlier&&!RemoveAsks){remove();return;}
+    NSString *name=self.path.lastPathComponent,*time=[self dateText:self.history[earlier?indexes.lastIndex+1:indexes.firstIndex][@"time"]];
+    NSAlert *alert=[NSAlert new];
+    alert.messageText=!earlier?[NSString stringWithFormat:@"Remove version %lu?",(unsigned long)indexes.firstIndex+1]:indexes.count==1?@"Remove the earlier version?":[NSString stringWithFormat:@"Remove the %lu earlier versions?",(unsigned long)indexes.count];
+    alert.informativeText=[NSString stringWithFormat:@"%@ will be deleted from memory and from disk. This cannot be undone.",earlier?[NSString stringWithFormat:@"Every version of %@ before the one on screen (%@)",name,time]:[NSString stringWithFormat:@"Version %lu of %@ (%@)",(unsigned long)indexes.firstIndex+1,name,time]];
+    [alert addButtonWithTitle:@"Remove"].hasDestructiveAction=YES;[alert addButtonWithTitle:@"Cancel"];alert.showsSuppressionButton=!earlier;alert.suppressionButton.title=@"Do not ask again";
+    void (^answer)(NSModalResponse)=^(NSModalResponse response){
+        self.pendingAlert=nil;self.pendingAnswer=nil;if(response!=NSAlertFirstButtonReturn)return;
+        if(!earlier&&alert.suppressionButton.state==NSControlStateValueOn){RemoveAsks=NO;if(!Background())[NSUserDefaults.standardUserDefaults setBool:YES forKey:@"RemoveVersionsWithoutAsking"];}
+        remove();
+    };
+    if(Background()){self.pendingAlert=alert;self.pendingAnswer=answer;}else [alert beginSheetModalForWindow:self.window completionHandler:answer];
+}
+- (void)removeThisVersion:(id)sender {if(self.versionIndex>=0)[self askToRemove:[NSIndexSet indexSetWithIndex:self.versionIndex] earlier:NO];}
+- (void)removeVersion:(NSMenuItem *)sender {[self askToRemove:[NSIndexSet indexSetWithIndex:[sender.representedObject unsignedIntegerValue]] earlier:NO];}
+- (void)removeEarlierVersions:(id)sender {if(self.versionIndex>0)[self askToRemove:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0,self.versionIndex)] earlier:YES];}
 - (void)previousVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@(-1)}];}
 - (void)nextVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@1}];}
 - (void)latestVersion:(id)sender {[self.events addObject:@{@"kind":@7,@"historyStep":@0}];}
@@ -536,8 +685,20 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     SEL actions[]={@selector(previousVersion:),@selector(nextVersion:),@selector(latestVersion:)};
     for(int i=0;i<3;i++){NSMenuItem *item=[self item:titles[i] action:actions[i] key:keys[i] menu:self.versionsMenu];item.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagOption;item.enabled=i==0?previous:next;}
     [self.versionsMenu addItem:NSMenuItem.separatorItem];
-    for(NSInteger i=(NSInteger)self.history.count-1;i>=0;i--){NSString *title=[NSString stringWithFormat:@"Version %ld — %@%@",(long)i+1,[self dateText:self.history[i][@"time"]],i==(NSInteger)self.history.count-1?@" (Latest)":@""];
-        NSMenuItem *item=[self item:title action:@selector(selectVersion:) key:@"" menu:self.versionsMenu];item.representedObject=@(i);item.state=i==self.versionIndex?NSControlStateValueOn:NSControlStateValueOff;}
+    // 文言：去版三途：去所览者，择一而去，尽去其前。汉语：删除没有快捷键，也不能把最后一个版本删掉。
+    NSInteger count=self.history.count;BOOL several=count>1;
+    [self item:@"Remove This Version" action:@selector(removeThisVersion:) key:@"" menu:self.versionsMenu].enabled=several&&self.versionIndex>=0;
+    NSMenu *removal=[[NSMenu alloc]initWithTitle:@"Remove Version"];removal.autoenablesItems=NO;
+    NSMenuItem *choose=[self.versionsMenu addItemWithTitle:@"Remove Version" action:nil keyEquivalent:@""];choose.submenu=removal;choose.enabled=several;
+    [self item:@"Remove Earlier Versions…" action:@selector(removeEarlierVersions:) key:@"" menu:self.versionsMenu].enabled=self.versionIndex>0;
+    [self.versionsMenu addItem:NSMenuItem.separatorItem];
+    NSUInteger stored=0;unsigned long long disk=0;
+    for(NSInteger i=count-1;i>=0;i--){NSDictionary *snapshot=self.history[i];NSString *title=[NSString stringWithFormat:@"Version %ld — %@%@",(long)i+1,[self dateText:snapshot[@"time"]],i==count-1?@" (Latest)":@""];
+        NSMenuItem *item=[self item:title action:@selector(selectVersion:) key:@"" menu:self.versionsMenu];item.representedObject=@(i);item.state=i==self.versionIndex?NSControlStateValueOn:NSControlStateValueOff;
+        NSMenuItem *remove=[self item:title action:@selector(removeVersion:) key:@"" menu:removal];remove.representedObject=@(i);remove.state=item.state;
+        if(snapshot[@"stem"]){stored++;disk+=[snapshot[@"disk"] unsignedLongLongValue];}}
+    if(count&&StoreBase()){[self.versionsMenu addItem:NSMenuItem.separatorItem];
+        [self.versionsMenu addItemWithTitle:[NSString stringWithFormat:@"Stored on disk: %lu of %ld · %@",(unsigned long)stored,(long)count,[NSByteCountFormatter stringFromByteCount:(long long)disk countStyle:NSByteCountFormatterCountStyleFile]] action:nil keyEquivalent:@""].enabled=NO;}
     [self layoutJumpControls];
 }
 
@@ -742,7 +903,10 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     if([op isEqual:@"saveScheduler"]){self.scheduler=[a copy];return @0;}
     if([op isEqual:@"renameJump"])return @([self renameJumpID:a[0] name:a[1]]);
     if([op isEqual:@"closeWindow"]){[self closeWindow:nil];return @0;}
-    if([op isEqual:@"number"]){NSString *k=a[0];if([k hasPrefix:@"scheduler"])return self.scheduler[[[k substringFromIndex:9] integerValue]];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"versions"])return @(self.history.count);if([k isEqual:@"versionIndex"])return @(self.versionIndex);if([k isEqual:@"same"])return @([self.history.lastObject[@"digest"] isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
+    if([op isEqual:@"number"]){NSString *k=a[0];if([k hasPrefix:@"scheduler"])return self.scheduler[[[k substringFromIndex:9] integerValue]];if([k isEqual:@"clock"])return @((NSInteger)(NSProcessInfo.processInfo.systemUptime*1000));if([k isEqual:@"generation"])return self.event[@"generation"]?:@0;if([k isEqual:@"count"])return @([self matchLines].count);if([k isEqual:@"jumps"])return @(self.jumpPoints.count);if([k isEqual:@"versions"])return @(self.history.count);
+        // 文言：未有所览，则视同随新，且不以同文为未变。汉语：还没有显示任何版本时（版本库里的最新一版读不出来），读到的文件必须显示出来：
+        // 报告为“正在跟随最新”，并且不因内容与最新一版相同而跳过。
+        if([k isEqual:@"versionIndex"])return @(self.versionIndex<0?(NSInteger)self.history.count-1:self.versionIndex);if([k isEqual:@"same"])return @(self.versionIndex>=0&&[self.history.lastObject[@"digest"] isEqual:self.candidateDigest]);if([k isEqual:@"follow"])return @(self.follow);if([k isEqual:@"opened"])return @(self.path!=nil);return @0;}
     if([op isEqual:@"text"]){NSInteger i=[a[0] integerValue];NSArray *lines=[self matchLines];return i>=0&&i<lines.count?lines[i][@"text"]:@"";}
     if([op isEqual:@"oldtext"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.lines.count?self.lines[i][@"text"]:@"";}
     if([op isEqual:@"anchor"]){NSInteger i=[a[0] integerValue];return i>=0&&i<self.anchors.count?self.anchors[i][@"text"]:@"";}
@@ -756,7 +920,22 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     if([op isEqual:@"prepareHistory"]){NSInteger index=self.event[@"historyIndex"]?[self.event[@"historyIndex"] integerValue]:[self.event[@"historyStep"] integerValue]==0?(NSInteger)self.history.count-1:self.versionIndex+[self.event[@"historyStep"] integerValue];return @([self prepareVersion:index]);}
     if([op isEqual:@"history"]){[self.events addObject:@{@"kind":@7,@"historyIndex":a[0]}];return @0;}
     if([op isEqual:@"historyStep"]){[self.events addObject:@{@"kind":@7,@"historyStep":a[0]}];return @0;}
-    if([op isEqual:@"inspectVersions"]){NSMutableArray *list=[NSMutableArray new];for(NSDictionary *s in self.history)[list addObject:@{@"digest":s[@"digest"],@"time":@([s[@"time"] timeIntervalSince1970]*1000),@"bytes":@([s[@"data"] length]),@"pages":@([s[@"doc"] pageCount])}];return list;}
+    if([op isEqual:@"inspectVersions"]){NSMutableArray *list=[NSMutableArray new];for(NSDictionary *s in self.history)[list addObject:@{@"digest":s[@"digest"],@"time":@([s[@"time"] timeIntervalSince1970]*1000),@"bytes":s[@"bytes"],@"pages":@([s[@"doc"] pageCount]),@"stored":@(s[@"stem"]!=nil),@"disk":s[@"disk"]?:@0,@"document":@(s[@"doc"]!=nil),@"words":@(s[@"words"]!=nil),@"lines":@(s[@"lines"]!=nil)}];return list;}
+    if([op isEqual:@"inspectStore"]){NSString *folder=[self storeFolder];NSArray *files=folder?[[NSFileManager.defaultManager contentsOfDirectoryAtPath:folder error:nil] sortedArrayUsingSelector:@selector(compare:)]:nil;
+        return @{@"enabled":@(StoreBase()!=nil),@"folder":folder?:@"",@"files":files?:@[]};}
+    if([op isEqual:@"removeVersion"]){[self removeVersions:[NSIndexSet indexSetWithIndex:[a[0] unsignedIntegerValue]]];return @0;}
+    // 文言：验其问答。汉语：后台模式下待答的确认框：inspectAlert 读其文字，testAlert 作答（第一个参数 0 为 Remove、1 为 Cancel，第二个为是否勾选“不再询问”）。
+    if([op isEqual:@"inspectAlert"]){NSAlert *alert=self.pendingAlert;NSMutableArray *buttons=[NSMutableArray new];for(NSButton *button in alert.buttons)[buttons addObject:button.title];
+        return @{@"pending":@(alert!=nil),@"asks":@(RemoveAsks),@"message":alert.messageText?:@"",@"info":alert.informativeText?:@"",@"buttons":buttons,@"suppression":@(alert.showsSuppressionButton),@"box":alert.suppressionButton.title?:@"",@"destructive":@(alert.buttons.firstObject.hasDestructiveAction)};}
+    if([op isEqual:@"testAlert"]){void (^answer)(NSModalResponse)=self.pendingAnswer;if(!answer)return @0;self.pendingAlert.suppressionButton.state=[a[1] boolValue]?NSControlStateValueOn:NSControlStateValueOff;answer(NSAlertFirstButtonReturn+[a[0] integerValue]);return @1;}
+    if([op isEqual:@"testAsk"]){RemoveAsks=[a[0] boolValue];return @0;}
+    if([op isEqual:@"inspectVersionMenu"]){NSMutableArray *items=[NSMutableArray new];
+        for(NSMenuItem *item in self.versionsMenu.itemArray){NSMutableArray *inner=[NSMutableArray new];for(NSMenuItem *sub in item.submenu.itemArray)[inner addObject:@{@"title":sub.title,@"enabled":@(sub.enabled),@"on":@(sub.state==NSControlStateValueOn)}];
+            [items addObject:@{@"title":item.separatorItem?@"-":item.title,@"enabled":@(item.enabled),@"on":@(item.state==NSControlStateValueOn),@"key":item.keyEquivalent,@"items":inner}];}
+        return items;}
+    // 文言：验菜单之实。汉语：按标题执行“版本”菜单里的一项（第二个参数是子菜单项的标题），与用户点击走同一条路；被禁用的项不执行。
+    if([op isEqual:@"testVersionMenu"]){NSMenuItem *item=[self.versionsMenu itemWithTitle:a[0]];if(a.count>1&&item.enabled)item=[item.submenu itemWithTitle:a[1]];
+        if(!item||!item.enabled||!item.action)return @0;[NSApp sendAction:item.action to:item.target from:item];return @1;}
     if([op isEqual:@"navigate"]){self.navigationSource=a[0];self.navigationLine=[a[1] integerValue];self.navigationSerial++;[self reload:nil];return @0;}
     if([op isEqual:@"commit"]){[self commitLine:[a[0] integerValue] anchor:[a[1] integerValue]];return @0;}
     if([op isEqual:@"finishMatch"])return @([self finishMatch:[a[0] integerValue] anchor:[a[1] integerValue]]);
@@ -818,7 +997,8 @@ static Viewer *OpenWindow(NSString *path) {
 static id Dispatch(NSString *op,NSArray *args) {
     if(!Windows){Windows=[NSMutableArray new];Histories=[NSMutableDictionary new];DiffCache=[NSMutableDictionary new];
         // 文言：验时恒启，不读不写其好。汉语：后台测试模式固定开启且不读写用户偏好；正常运行时默认开启并记住选择。
-        DiffHints=Background()||![NSUserDefaults.standardUserDefaults objectForKey:@"HighlightChanges"]||[NSUserDefaults.standardUserDefaults boolForKey:@"HighlightChanges"];}
+        DiffHints=Background()||![NSUserDefaults.standardUserDefaults objectForKey:@"HighlightChanges"]||[NSUserDefaults.standardUserDefaults boolForKey:@"HighlightChanges"];
+        RemoveAsks=Background()||![NSUserDefaults.standardUserDefaults boolForKey:@"RemoveVersionsWithoutAsking"];}
     if([op isEqual:@"init"]){V=OpenWindow(args.count?args[0]:nil);return @0;}
     if([op isEqual:@"openNew"])return OpenWindow(args.count?args[0]:nil).windowID;
     if([op isEqual:@"inspectWindows"]){NSMutableArray *out=[NSMutableArray new];for(Viewer *viewer in Windows)[out addObject:@{@"id":viewer.windowID,@"path":viewer.path?:@""}];return out;}

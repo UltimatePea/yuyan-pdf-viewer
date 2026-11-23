@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.8-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.9-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -26,7 +26,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.8-macos-arm64.zip`, then open `阅卷.app` or move 
 - The bottom status shows the last successful PDF update in system-local time, including seconds (`YYYY-MM-DD HH:mm:ss`); unchanged content does not reset it.
 - Text anchors preserve the reading passage and its viewport position across page insertion/deletion, with coordinate fallback for image-only pages.
 - Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
-- In-memory PDF version history with Previous, Next and Latest navigation.
+- PDF version history, stored on disk, with Previous, Next and Latest navigation and menu items to remove versions.
 - Change highlights between consecutive versions: added words in green, words the next version deletes in red. On by default; **View → Highlight Changes** turns them off.
 - An overview bar along the left edge marks where the changes are in the whole document, and **↑ / ↓** buttons step through them.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.
@@ -35,13 +35,23 @@ Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content
 
 ## Version history
 
-Every successfully loaded content change is retained as an immutable PDF snapshot **in memory**, with its original update timestamp. After the first refresh, compact **‹ vN/Total ›** controls appear in the toolbar: the arrows move between versions, and clicking the version counter returns to Latest. The **Versions** menu lists every snapshot by number and timestamp.
+Every successfully loaded content change is retained as an immutable PDF snapshot with its original update timestamp, and is **stored on disk**, so the history is still there after the app is quit and reopened. After the first refresh, compact **‹ vN/Total ›** controls appear in the toolbar: the arrows move between versions, and clicking the version counter returns to Latest. The **Versions** menu lists every snapshot by number and timestamp.
 
 - **⌥⌘[**: previous version; **⌥⌘]**: next version; **⌥⌘0**: latest version.
 - While viewing an older version, new successful refreshes are collected without replacing what you are reading. Returning to Latest resumes live updates.
 - Version changes preserve zoom, display mode and the reading position using the same heuristic text anchors. Viewing history never writes an old PDF back to disk.
-- Histories are separate for each PDF path and survive closing/reopening documents within the running app. **Quitting the app clears history.** Snapshots are never evicted during the session, so memory use grows with the number and size of captured PDFs.
+- Histories are separate for each PDF path. Moving or renaming a PDF starts a new history.
 - Invalid/partial reads, stale asynchronous results and consecutive identical content are excluded. Rapid builds overwritten before the viewer captures them cannot be recovered. A disk revert to earlier content is retained as a new chronological version.
+
+**Stored versions.** Versions are kept in `~/Library/Application Support/YuyanPDFViewer/Versions/`, in one folder for each PDF. Each version is a copy of the PDF, named by its time and content hash, with two cache files that hold its extracted lines and words. When a PDF is opened, its latest stored version is shown at once, and the file on disk is then read as usual; older versions are read only when they are shown or compared, and every version captured or read during a session stays in memory until the app quits. Nothing is removed automatically, so the folder grows with every rebuild: a 200-page paper takes about 3 MB for each version. The last line of the **Versions** menu shows how many versions of the document are stored and their size. A version that cannot be written is kept for the session, and the status bar says `not saved to disk`.
+
+**Removing versions.** The **Versions** menu has three items for this, without shortcuts:
+
+- **Remove This Version** removes the version on screen and shows the one after it, or the one before it if it was the latest.
+- **Remove Version** lists every version; choose one to remove it without leaving the version on screen.
+- **Remove Earlier Versions…** removes every version before the one on screen.
+
+A removed version is deleted from memory and from disk and cannot be restored, so each removal asks for confirmation first. For a single version the confirmation has a **Do not ask again** box; **Remove Earlier Versions…** always asks. To be asked again, run `defaults delete org.yuyan.reader RemoveVersionsWithoutAsking`. The last remaining version cannot be removed. Once a version is gone, its neighbours are compared with each other. So when one build contains an edit you did not want and a later build reverts it, remove the version in between: the highlights then show only the real difference. Removing versions never touches the PDF itself. If the latest version is removed while the file still has that content, the content is recorded again the next time the file is read.
 
 Explicit SyncTeX navigation returns to Latest, because the source and SyncTeX files describe the current build. [Changelog](CHANGELOG.md).
 
@@ -85,7 +95,7 @@ YY_ROOT=/path/to/yuyan-wktree-1 ./构建.sh
 YY_ROOT=/path/to/yuyan-wktree-1 ./发布.sh
 ```
 
-Tests run in the background without activating the app. Set `YY_VIEWER_BACKGROUND=1` when running an individual test script. Tests run the actual Yuyan Wasm-GC application with PDFKit. The integration suite also requires `latexmk` and LaTeX. A logged-in macOS graphical session is required. To run the private-document crash regression as well, set `YY_CRASH_PDF=/path/to/test-copy.pdf`; the test creates another temporary copy and never rewrites the supplied file.
+Tests run in the background without activating the app. Set `YY_VIEWER_BACKGROUND=1` when running an individual test script. In background mode the app never reads or writes your stored versions; it stores versions only when `YY_VERSIONS_DIRECTORY` names a folder. Tests run the actual Yuyan Wasm-GC application with PDFKit. The integration suite also requires `latexmk` and LaTeX. A logged-in macOS graphical session is required. To run the private-document crash regression as well, set `YY_CRASH_PDF=/path/to/test-copy.pdf`; the test creates another temporary copy and never rewrites the supplied file.
 
 ```sh
 # Navigate an already-open PDF after compilation:
