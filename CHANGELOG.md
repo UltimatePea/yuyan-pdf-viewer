@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.8 — 2026-11-23
+
+- Add an overview bar along the left edge of the window. It stands for the whole document, like a scrollbar with marks: green where the version adds words, red where the next version deletes them, and a grey block for the part in view. Click or drag on it to go there; click a mark to go to that change.
+- Add **↑** and **↓** buttons beside the version controls that go to the previous and the next set of changes, with **⌥⌘↑** / **⌥⌘↓** and View menu items. Changes within about two lines of each other form one set. Stepping visits a change that is already in view first, wraps around, keeps the horizontal scroll, and works in single-page display.
+- Show the number of the visited set in the status bar, such as `Change 3/12`, and outline it on the bar.
+- Hide the bar and the two buttons while **Highlight Changes** is off.
+
 ## v0.2.7 — 2026-11-23
 
 - Highlight changes between consecutive PDF versions. Words added since the previous version have a green background. While viewing an older version, words that the next version deletes have a red background. The status bar shows the word counts, such as `+72 −147`.

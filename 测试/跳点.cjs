@@ -42,7 +42,7 @@ function* scenario(){
  const commits=state().commits;fs.writeFileSync(file,modified);yield* wait(()=>state().commits>commits,'edit saved passage');api('testPosition',[0,1.3,500]);yield* jump(a.id);check(state().page===2,'changed target text uses a neighboring anchor');
  yield* replace(['Only']);api('testPosition',[0,1.3,500]);yield* jump(a.id);check(state().page===0&&state().status.includes('approximate'),'removed target falls back safely and reports approximation');
  yield* replace(['Inserted','Alpha','Beta','Gamma','Delta']);api('testPosition',[0,1.3,500]);yield* jump(a.id);check(state().page===3,'returning content recovers the original semantic anchor');
- const before=state().anchor.text;api('removeJump',[named.id]);check(points().length===1&&points()[0].id===a.id,'remove leaves other points intact');check(state().anchor.text===before,'removing a point never navigates');
+ api('testSize',[1400,820]);const before=state().anchor.text;api('removeJump',[named.id]);check(points().length===1&&points()[0].id===a.id,'remove leaves other points intact');check(state().anchor.text===before,'removing a point never navigates');
  api('jump',[named.id]);yield* delay(100);check(state().anchor.text===before,'queued action for a removed point is harmless');
  const other=path.join(root,'image-only.pdf');fs.writeFileSync(other,pdf(['Image','Image'],{image:true}));api('open',[other]);yield* wait(()=>state().pages===2,'other document');check(points().length===0,'jump points are isolated by document');
  api('testPosition',[1,1.2,500]);yield* add('');const imagePoint=points()[0];api('testPosition',[0,1.2,500]);yield* jump(imagePoint.id);check(state().page===1&&state().status.includes('approximate'),'image-only jump preserves page coordinates');

@@ -5,12 +5,14 @@
 // 文言：较邻版之文，以词为度；页边行号、行末断词、越页之移，皆不为异。
 // 汉语：相邻版本的词级差异。页边行号与页码（只含一个数的行，或行首行尾脱离正文的数）不参与比较；行尾连字符断开的词合并为一词，比较时忽略连字符；
 // 在多页同一位置重复出现的页眉页脚不参与比较；仅因分页而换页的文字不算改动。只使用已验证的文本范围，从不读取 PDFSelection.string。
-typedef struct {uint64_t key;uint32_t page,loc,len,flags;} DiffToken;
+// 文言：词记其页、其位、其行之高下。汉语：每个词 24 字节：散列、页、字符范围，以及所在行的上缘（页坐标）和行高（八分之一点）。
+// 行的上下位置用于概览条和逐处跳转，不必再向 PDFKit 询问每个范围的位置。
+typedef struct {uint64_t key;uint32_t loc;uint16_t page,len;float top;uint16_t tall,flags;} DiffToken;
 // Ignored: a margin number. Joined: the rest of the word before it. Tail, Head: the last or first character sits beside a
 // margin number that PDFKit glued to the word, and PDFKit reports that one character stretched across the line.
 enum {DiffIgnored=1,DiffJoined=2,DiffTail=4,DiffHead=8,DiffSkipped=DiffIgnored|DiffJoined};
 static const NSUInteger DiffCells=1<<22,DiffDepth=64,DiffMoveWindow=400,DiffSelectionLimit=20000,DiffBands=3,DiffRepeats=3,DiffAnchors=10,DiffAnchorReach=60,DiffShiftTries=4,DiffPlaceTries=48,DiffBoxBudget=5000;
-static const CGFloat DiffPlaceSlack=1.5;
+static const CGFloat DiffPlaceSlack=1.5,DiffSetGap=30;
 
 static BOOL DiffHyphen(unichar c) {return c=='-'||c==0x2010||c==0x2011||c==0x00AD;}
 static BOOL DiffDigits(NSString *s) {
@@ -42,7 +44,7 @@ typedef struct {uint32_t first,lead,tail,page;float y;uint8_t hyphen,band;} Diff
 @property NSMutableArray<NSString *> *words;
 @property BOOL failed;
 - (NSRect)boundsOf:(NSRange)range page:(PDFPage *)page;
-- (void)addLine:(PDFSelection *)line page:(PDFPage *)page index:(NSUInteger)index text:(NSString *)text y:(CGFloat)y;
+- (void)addLine:(PDFSelection *)line page:(PDFPage *)page index:(NSUInteger)index text:(NSString *)text box:(NSRect)box;
 - (NSData *)finish;
 @end
 @implementation DiffWords
@@ -58,7 +60,7 @@ typedef struct {uint32_t first,lead,tail,page;float y;uint8_t hyphen,band;} Diff
     BOOL reversed=after?NSMinX(box)+1<NSMinX(other):NSMinX(other)+1<NSMinX(box);
     return box.size.width>1.2*box.size.height*number.length||reversed||gap>.6*height;
 }
-- (void)addLine:(PDFSelection *)line page:(PDFPage *)page index:(NSUInteger)index text:(NSString *)text y:(CGFloat)y {
+- (void)addLine:(PDFSelection *)line page:(PDFPage *)page index:(NSUInteger)index text:(NSString *)text box:(NSRect)box {
     if(self.failed)return;
     NSUInteger first=self.tokens.length/sizeof(DiffToken),ranges=[line numberOfTextRangesOnPage:page];
     NSMutableArray<NSString *> *words=self.words;NSCharacterSet *space=NSCharacterSet.whitespaceAndNewlineCharacterSet;
@@ -71,7 +73,7 @@ typedef struct {uint32_t first,lead,tail,page;float y;uint8_t hyphen,band;} Diff
             if(!gap&&start==NSNotFound)start=c;
             if(!gap||start==NSNotFound)continue;
             NSString *word=DiffWord([text substringWithRange:NSMakeRange(start,c-start)]);
-            DiffToken token={DiffHash(word),(uint32_t)index,(uint32_t)start,(uint32_t)(c-start),0};
+            DiffToken token={.key=DiffHash(word),.loc=(uint32_t)start,.page=(uint16_t)MIN(index,UINT16_MAX),.len=(uint16_t)MIN(c-start,UINT16_MAX),.top=(float)NSMaxY(box),.tall=(uint16_t)MAX(0,MIN(box.size.height*8,UINT16_MAX)),.flags=0};
             [self.tokens appendBytes:&token length:sizeof token];[words addObject:word];start=NSNotFound;
         }
     }
@@ -94,7 +96,7 @@ typedef struct {uint32_t first,lead,tail,page;float y;uint8_t hyphen,band;} Diff
         t[0].loc+=digits;t[0].len-=digits;t[0].flags|=DiffHead;words[first]=DiffWord([text substringWithRange:NSMakeRange(t[0].loc,t[0].len)]);t[0].key=DiffHash(words[first]);
     }
     BOOL hyphen=t[tail].len>1&&DiffHyphen([text characterAtIndex:t[tail].loc+t[tail].len-1]);
-    DiffLine record={(uint32_t)first,(uint32_t)lead,(uint32_t)tail,(uint32_t)index,(float)y,hyphen,0};
+    DiffLine record={(uint32_t)first,(uint32_t)lead,(uint32_t)tail,(uint32_t)index,(float)NSMinY(box),hyphen,0};
     [self.lines appendBytes:&record length:sizeof record];
 }
 // 文言：页首页末之文，屡见于诸页者，页眉页脚也，不较。行末断词，续于次行。
@@ -343,17 +345,40 @@ static NSDictionary *DiffCompute(NSData *oldTokens,NSData *newTokens,PDFDocument
     return @{@"old":oldFlags,@"new":newFlags,@"deleted":@(deleted),@"added":@(added)};
 }
 // 文言：相连之词合为一段而染之。汉语：同页且相邻的改动词合并为一个范围；被忽略的行号会断开范围，不被染色。
-// 与粘连行号相邻的那个字符位置不可靠，不纳入范围，并在此处断开。返回 [页, 起点, 长度]。
+// 与粘连行号相邻的那个字符位置不可靠，不纳入范围，并在此处断开。返回 [页, 起点, 长度, 上缘, 下缘]，上下缘取自各词所在的行。
 static NSArray<NSArray<NSNumber *> *> *DiffRuns(NSData *tokens,NSData *flags) {
     const DiffToken *t=tokens.bytes;const uint8_t *f=flags.bytes;NSUInteger n=MIN(tokens.length/sizeof(DiffToken),flags.length);
     NSMutableArray *out=[NSMutableArray new];
     for(NSUInteger i=0;i<n;){
         if(!f[i]){i++;continue;}
-        NSUInteger page=t[i].page,start=t[i].loc+(t[i].flags&DiffHead?1:0),end=t[i].loc+t[i].len-(t[i].flags&DiffTail?1:0);BOOL closed=(t[i].flags&DiffTail)!=0;i++;
-        while(!closed&&i<n&&f[i]&&t[i].page==page&&!(t[i].flags&DiffHead)&&t[i].loc>=end&&t[i].loc-end<=2){end=t[i].loc+t[i].len-(t[i].flags&DiffTail?1:0);closed=(t[i].flags&DiffTail)!=0;i++;}
-        if(end>start)[out addObject:@[@(page),@(start),@(end-start)]];
+        NSUInteger page=t[i].page,start=t[i].loc+(t[i].flags&DiffHead?1:0),end=t[i].loc+t[i].len-(t[i].flags&DiffTail?1:0);BOOL closed=(t[i].flags&DiffTail)!=0;
+        float top=t[i].top,bottom=t[i].top-t[i].tall/8.f;i++;
+        while(!closed&&i<n&&f[i]&&t[i].page==page&&!(t[i].flags&DiffHead)&&t[i].loc>=end&&t[i].loc-end<=2){
+            end=t[i].loc+t[i].len-(t[i].flags&DiffTail?1:0);closed=(t[i].flags&DiffTail)!=0;
+            top=MAX(top,t[i].top);bottom=MIN(bottom,t[i].top-t[i].tall/8.f);i++;
+        }
+        if(end>start)[out addObject:@[@(page),@(start),@(end-start),@(top),@(bottom)]];
     }
     return out;
+}
+// 文言：近者合为一处，以便逐处览之。
+// 汉语：把改动范围合成“处”，供“上一处/下一处”逐处跳转：同页且上下相距不超过 DiffSetGap 点的范围合为一处，按页、自上而下排列。
+// 输入每项为 [页, 上缘, 下缘, 是否为删除]，输出每项记页、上下缘和其中新增、删除范围的个数。
+static NSArray<NSDictionary *> *DiffSets(NSArray<NSArray<NSNumber *> *> *marks) {
+    NSArray<NSArray<NSNumber *> *> *sorted=[marks sortedArrayUsingComparator:^NSComparisonResult(NSArray<NSNumber *> *x,NSArray<NSNumber *> *y){
+        NSComparisonResult page=[x[0] compare:y[0]];return page!=NSOrderedSame?page:[y[1] compare:x[1]];
+    }];
+    NSMutableArray *sets=[NSMutableArray new];NSNumber *page=nil;double top=0,bottom=0;NSUInteger added=0,deleted=0;
+    for(NSArray<NSNumber *> *mark in sorted){
+        if(page&&(![page isEqual:mark[0]]||bottom-mark[1].doubleValue>DiffSetGap)){
+            [sets addObject:@{@"page":page,@"top":@(top),@"bottom":@(bottom),@"added":@(added),@"deleted":@(deleted)}];page=nil;
+        }
+        if(!page){page=mark[0];top=mark[1].doubleValue;bottom=mark[2].doubleValue;added=deleted=0;}
+        else {top=MAX(top,mark[1].doubleValue);bottom=MIN(bottom,mark[2].doubleValue);}
+        if(mark[3].boolValue)deleted++;else added++;
+    }
+    if(page)[sets addObject:@{@"page":page,@"top":@(top),@"bottom":@(bottom),@"added":@(added),@"deleted":@(deleted)}];
+    return sets;
 }
 static NSArray<PDFSelection *> *DiffSelections(PDFDocument *document,NSData *tokens,NSData *flags,NSColor *color) {
     NSMutableArray *out=[NSMutableArray new];

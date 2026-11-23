@@ -22,7 +22,7 @@ static NSArray *Lines(PDFDocument *doc, NSUInteger *skipped, DiffWords *words) {
             if(!ValidTextRanges(line,page)){(*skipped)++;continue;}
             NSRect rect=[line boundsForPage:page];
             // 文言：取词有失，止其较文，不碍观卷。汉语：取词出现异常时只放弃这一版本的差异提示，不影响加载。
-            @try{[words addLine:line page:page index:p text:content y:NSMinY(rect)];}@catch(NSException *exception){words.failed=YES;}
+            @try{[words addLine:line page:page index:p text:content box:rect];}@catch(NSException *exception){words.failed=YES;}
             NSString *text=Normalize(line.string); if(!text.length) continue;
             [out addObject:@{@"text":text,@"page":@(p),@"rect":NSStringFromRect(rect),@"label":page.label?:@""}];
         }
@@ -44,7 +44,41 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 - (BOOL)canBecomeMainWindow {return !Background()&&[super canBecomeMainWindow];}
 @end
 @interface DropPDF : PDFView <NSDraggingDestination> @end
-@interface Viewer : NSObject <NSApplicationDelegate,NSWindowDelegate,NSSearchFieldDelegate>
+// 文言：左缘立条，以观全卷之改：绿者增，红者将删。汉语：窗口左缘的概览条，自上而下代表整份文档，如同带标记的滚动条。
+// 右半绿色是相对前一版新增之处，左半红色是下一版将删去之处；灰块是当前可见的范围，细框是刚跳到的那一处。
+// 点击或拖动即跳到相应位置。所有位置都是 0 到 1 之间的文档比例。
+static const CGFloat StripWidth=14,ChangeLine=.3;
+@interface ChangeStrip : NSView
+@property NSArray<NSArray<NSNumber *> *> *marks;
+@property double visibleStart,visibleEnd,currentStart,currentEnd;
+@property (copy) void (^clicked)(double fraction);
+@end
+@implementation ChangeStrip
+- (BOOL)isFlipped {return YES;}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {return YES;}
+- (NSRect)band:(double)start to:(double)end x:(CGFloat)x width:(CGFloat)width least:(CGFloat)least {
+    CGFloat height=self.bounds.size.height,y0=floor(start*height),y1=ceil(end*height);
+    if(y1-y0<least){y0=MAX(0,MIN(height-least,round((start+end)/2*height-least/2)));y1=y0+least;}
+    return NSMakeRect(x,y0,width,y1-y0);
+}
+- (void)drawRect:(NSRect)dirty {
+    CGFloat width=self.bounds.size.width;
+    [[NSColor.labelColor colorWithAlphaComponent:.06] setFill];NSRectFillUsingOperation(self.bounds,NSCompositingOperationSourceOver);
+    if(self.visibleEnd>self.visibleStart){[[NSColor.labelColor colorWithAlphaComponent:.16] setFill];NSRectFillUsingOperation([self band:self.visibleStart to:self.visibleEnd x:0 width:width least:6],NSCompositingOperationSourceOver);}
+    for(NSArray<NSNumber *> *mark in self.marks){
+        BOOL deleted=mark[2].boolValue;[(deleted?NSColor.systemRedColor:NSColor.systemGreenColor) setFill];
+        NSRectFill([self band:mark[0].doubleValue to:mark[1].doubleValue x:deleted?2:width/2+1 width:width/2-3 least:3]);
+    }
+    if(self.currentEnd>self.currentStart){[NSColor.labelColor setStroke];[NSBezierPath strokeRect:NSInsetRect([self band:self.currentStart to:self.currentEnd x:0 width:width least:6],.5,.5)];}
+}
+- (void)jump:(NSEvent *)event {
+    CGFloat height=self.bounds.size.height;
+    if(height>0&&self.clicked)self.clicked(MAX(0,MIN(1,[self convertPoint:event.locationInWindow fromView:nil].y/height)));
+}
+- (void)mouseDown:(NSEvent *)event {[self jump:event];}
+- (void)mouseDragged:(NSEvent *)event {[self jump:event];}
+@end
+@interface Viewer : NSObject <NSApplicationDelegate,NSWindowDelegate,NSSearchFieldDelegate,NSMenuItemValidation>
 @property NSWindow *window;
 @property NSMenu *menuBar,*windowMenu;
 @property NSNumber *cycleDestination;
@@ -71,7 +105,12 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 @property NSData *candidateWords;
 @property NSArray<PDFSelection *> *addedSelections,*deletedSelections;
 @property NSUInteger addedWords,deletedWords;
-@property NSMenuItem *diffItem;
+@property NSMenuItem *diffItem,*previousChangeItem,*nextChangeItem;
+@property ChangeStrip *changeStrip;
+@property NSButton *previousChangeButton,*nextChangeButton;
+@property NSArray<NSDictionary *> *changeSets;
+@property NSInteger changeIndex;
+@property (weak) NSClipView *watchedClip;
 @property PDFDocument *candidate;
 @property NSString *candidateDigest;
 @property NSMutableArray *events;
@@ -144,6 +183,9 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     [self item:@"Single Page / Continuous" action:@selector(mode:) key:@"" menu:view];
     [self item:@"Follow Edits" action:@selector(follow:) key:@"" menu:view];
     self.diffItem=[self item:@"Highlight Changes" action:@selector(toggleDiff:) key:@"" menu:view];self.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;
+    self.previousChangeItem=[self item:@"Previous Change" action:@selector(previousChange:) key:[NSString stringWithFormat:@"%C",(unichar)NSUpArrowFunctionKey] menu:view];
+    self.nextChangeItem=[self item:@"Next Change" action:@selector(nextChange:) key:[NSString stringWithFormat:@"%C",(unichar)NSDownArrowFunctionKey] menu:view];
+    self.previousChangeItem.keyEquivalentModifierMask=self.nextChangeItem.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagOption;
     self.jumpPoints=[NSMutableArray new];
     self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
     [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
@@ -159,6 +201,9 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     self.pdf=[[DropPDF alloc]initWithFrame:NSMakeRect(0,30,980,744)];self.pdf.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
     self.pdf.displayMode=kPDFDisplaySinglePageContinuous;self.pdf.autoScales=NO; self.pdf.backgroundColor=NSColor.windowBackgroundColor;
     [self.pdf registerForDraggedTypes:@[NSPasteboardTypeFileURL]];[root addSubview:self.pdf];
+    self.changeStrip=[[ChangeStrip alloc]initWithFrame:NSMakeRect(0,30,StripWidth,744)];self.changeStrip.autoresizingMask=NSViewHeightSizable;self.changeIndex=-1;
+    self.changeStrip.toolTip=@"Changes in this version: green is added, red is deleted by the next version. Click to go there.";[self.changeStrip setAccessibilityLabel:@"Changes overview"];
+    __weak Viewer *weak=self;self.changeStrip.clicked=^(double fraction){[weak stripClicked:fraction];};[root addSubview:self.changeStrip];
     CGFloat x=12;
     NSArray *titles=@[@"Open…",@"‹",@"›",@"−",@"+",@"Fit Width"];
     SEL actions[]={@selector(open:),@selector(previous:),@selector(next:),@selector(zoomOut:),@selector(zoomIn:),@selector(fitWidth:)};
@@ -170,7 +215,9 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     self.previousVersionButton=[NSButton buttonWithTitle:@"‹" target:self action:@selector(previousVersion:)];self.previousVersionButton.toolTip=@"Previous PDF version (⌥⌘[)";[self.previousVersionButton setAccessibilityLabel:@"Previous PDF version"];
     self.latestVersionButton=[NSButton buttonWithTitle:@"v1/1" target:self action:@selector(latestVersion:)];self.latestVersionButton.toolTip=@"Return to latest PDF version (⌥⌘0)";
     self.nextVersionButton=[NSButton buttonWithTitle:@"›" target:self action:@selector(nextVersion:)];self.nextVersionButton.toolTip=@"Next PDF version (⌥⌘])";[self.nextVersionButton setAccessibilityLabel:@"Next PDF version"];
-    for(NSButton *button in @[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]){button.font=[NSFont systemFontOfSize:11];[root addSubview:button];}
+    self.previousChangeButton=[NSButton buttonWithTitle:@"↑" target:self action:@selector(previousChange:)];self.previousChangeButton.toolTip=@"Previous change (⌥⌘↑)";[self.previousChangeButton setAccessibilityLabel:@"Previous change"];
+    self.nextChangeButton=[NSButton buttonWithTitle:@"↓" target:self action:@selector(nextChange:)];self.nextChangeButton.toolTip=@"Next change (⌥⌘↓)";[self.nextChangeButton setAccessibilityLabel:@"Next change"];
+    for(NSButton *button in @[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton,self.previousChangeButton,self.nextChangeButton]){button.font=[NSFont systemFontOfSize:11];[root addSubview:button];}
     self.jumpBar=[[NSScrollView alloc]initWithFrame:NSMakeRect(440,782,0,28)];self.jumpBar.autoresizingMask=NSViewMinYMargin;self.jumpBar.hasHorizontalScroller=NO;self.jumpBar.scrollerStyle=NSScrollerStyleOverlay;self.jumpBar.autohidesScrollers=YES;self.jumpBar.drawsBackground=NO;[root addSubview:self.jumpBar];[self refreshJumpMenus];
     self.search=[[NSSearchField alloc]initWithFrame:NSMakeRect(650,784,315,24)];self.search.placeholderString=@"Find in PDF";self.search.target=self;self.search.action=@selector(search:);self.search.delegate=self;self.search.sendsWholeSearchString=YES;self.search.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin;[root addSubview:self.search];
     self.previousSearchButton=[NSButton buttonWithTitle:@"‹" target:self action:@selector(previousSearch:)];self.nextSearchButton=[NSButton buttonWithTitle:@"›" target:self action:@selector(search:)];
@@ -179,11 +226,12 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     [self rebuildSearch];[self refreshVersionControls];[self layoutJumpControls];
     self.status=[NSTextField labelWithString:@"Open a PDF to begin"];self.status.frame=NSMakeRect(12,6,956,18);self.status.autoresizingMask=NSViewWidthSizable;self.status.lineBreakMode=NSLineBreakByTruncatingMiddle;[root addSubview:self.status];
     [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(pageChanged:) name:PDFViewPageChangedNotification object:self.pdf];
+    [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(scrolled:) name:PDFViewScaleChangedNotification object:self.pdf];
     [[NSDistributedNotificationCenter defaultCenter]addObserver:self selector:@selector(navigationRequest:) name:@"org.yuyan.reader.navigate" object:nil suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
     if(self==AppDelegate)[NSApp finishLaunching];if(!Background()){[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}
 }
 - (void)about:(id)sender {NSAlert *a=[NSAlert new];a.messageText=@"阅卷";a.informativeText=@"Yuyan · Wasm-GC · V8\nNative PDFKit viewer for continuously rebuilt papers.";[a beginSheetModalForWindow:self.window completionHandler:nil];}
-- (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];}
+- (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];[self refreshStrip];}
 - (void)windowDidResize:(NSNotification *)n {[self layoutJumpControls];if(self.fit)[self fitWidth:nil];}
 - (void)windowDidBecomeKey:(NSNotification *)n {NSApp.mainMenu=self.menuBar;NSApp.windowsMenu=self.windowMenu;}
 - (void)cycleWindow:(NSInteger)step {
@@ -244,7 +292,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 - (void)zoomIn:(id)sender {self.fit=NO;[self.pdf zoomIn:sender];}
 - (void)zoomOut:(id)sender {self.fit=NO;[self.pdf zoomOut:sender];}
 - (void)fitWidth:(id)sender {self.fit=YES;PDFPage *p=self.pdf.currentPage?:[self.pdf.document pageAtIndex:0];if(p){NSRect r=[p boundsForBox:self.pdf.displayBox];self.pdf.scaleFactor=MAX(.05,(self.pdf.bounds.size.width-28)/r.size.width);}}
-- (void)setModePreservingPosition:(PDFDisplayMode)mode {[self capture];self.pdf.displayMode=mode;[self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
+- (void)setModePreservingPosition:(PDFDisplayMode)mode {[self capture];self.pdf.displayMode=mode;[self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];[self refreshStrip];}
 - (void)mode:(id)sender {[self setModePreservingPosition:self.pdf.displayMode==kPDFDisplaySinglePageContinuous?kPDFDisplaySinglePage:kPDFDisplaySinglePageContinuous];}
 - (void)follow:(NSMenuItem *)sender {self.follow=!self.follow;sender.state=self.follow?NSControlStateValueOn:NSControlStateValueOff;}
 - (void)find:(id)sender {[self.window makeFirstResponder:self.search];}
@@ -326,6 +374,7 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     NSString *version=prefix.length?@"":[NSString stringWithFormat:@" · Version %ld/%lu",(long)self.versionIndex+1,self.history.count];
     NSString *changes=[NSString stringWithFormat:@"%@%@",self.addedWords?[NSString stringWithFormat:@" +%lu",self.addedWords]:@"",self.deletedWords?[NSString stringWithFormat:@" −%lu",self.deletedWords]:@""];
     if(changes.length)changes=[@" ·" stringByAppendingString:changes];
+    if(self.changeIndex>=0&&self.changeIndex<(NSInteger)self.changeSets.count)changes=[changes stringByAppendingFormat:@" · Change %ld/%lu",(long)self.changeIndex+1,self.changeSets.count];
     return [NSString stringWithFormat:@"%@Updated at %@%@%@ · %lu pages · %@",prefix,[self dateText:self.lastUpdated],version,changes,self.pdf.document.pageCount,self.path?:@""];
 }
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
@@ -361,20 +410,105 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 }
 - (void)rebuildDiff {
     self.addedSelections=@[];self.deletedSelections=@[];self.addedWords=0;self.deletedWords=0;
+    NSMutableArray<NSArray<NSNumber *> *> *marks=[NSMutableArray new];
     NSInteger index=self.versionIndex,count=self.history.count;PDFDocument *document=self.pdf.document;
     if(DiffHints&&document&&index>=0&&index<count&&self.history[index][@"doc"]==document){
         @try{
             NSDictionary *current=self.history[index],*diff=[self changeAt:index step:-1];
-            if(diff){self.addedWords=[diff[@"added"] unsignedIntegerValue];self.addedSelections=DiffSelections(document,current[@"words"],diff[@"new"],[NSColor.systemGreenColor colorWithAlphaComponent:.35]);}
+            if(diff){self.addedWords=[diff[@"added"] unsignedIntegerValue];self.addedSelections=DiffSelections(document,current[@"words"],diff[@"new"],[NSColor.systemGreenColor colorWithAlphaComponent:.35]);
+                for(NSArray<NSNumber *> *run in DiffRuns(current[@"words"],diff[@"new"]))[marks addObject:@[run[0],run[3],run[4],@NO]];}
             diff=[self changeAt:index step:1];
-            if(diff){self.deletedWords=[diff[@"deleted"] unsignedIntegerValue];self.deletedSelections=DiffSelections(document,current[@"words"],diff[@"old"],[NSColor.systemRedColor colorWithAlphaComponent:.35]);}
-        }@catch(NSException *exception){self.addedSelections=@[];self.deletedSelections=@[];self.addedWords=0;self.deletedWords=0;}
+            if(diff){self.deletedWords=[diff[@"deleted"] unsignedIntegerValue];self.deletedSelections=DiffSelections(document,current[@"words"],diff[@"old"],[NSColor.systemRedColor colorWithAlphaComponent:.35]);
+                for(NSArray<NSNumber *> *run in DiffRuns(current[@"words"],diff[@"old"]))[marks addObject:@[run[0],run[3],run[4],@YES]];}
+        }@catch(NSException *exception){self.addedSelections=@[];self.deletedSelections=@[];self.addedWords=0;self.deletedWords=0;[marks removeAllObjects];}
     }
-    [self applyHighlights];
+    [self applyHighlights];[self showChanges:marks];
+}
+
+// 文言：改处可逐一而览，亦可于左条一望而知。汉语：概览条与“上一处/下一处”。位置以文档比例计：页序加页内自上而下的比例，除以页数；
+// 与缩放和显示模式无关。跳转时把该处的上缘放在视口自上而下 ChangeLine 处，不改变横向滚动。
+- (double)fractionForPage:(NSUInteger)index y:(CGFloat)y {
+    PDFDocument *document=self.pdf.document;if(index>=document.pageCount)return 0;
+    NSRect box=[[document pageAtIndex:index] boundsForBox:self.pdf.displayBox];
+    double inside=box.size.height>0?(NSMaxY(box)-y)/box.size.height:0;
+    return (index+MAX(0,MIN(1,inside)))/document.pageCount;
+}
+- (double)fractionAtViewY:(CGFloat)y {
+    PDFDocument *document=self.pdf.document;if(!document.pageCount)return 0;
+    NSPoint point=NSMakePoint(NSMidX(self.pdf.bounds),y);PDFPage *page=[self.pdf pageForPoint:point nearest:YES];if(!page)return 0;
+    return [self fractionForPage:[document indexForPage:page] y:[self.pdf convertPoint:point toPage:page].y];
+}
+- (double)fractionOfSet:(NSInteger)index edge:(NSString *)edge {NSDictionary *set=self.changeSets[index];return [self fractionForPage:[set[@"page"] unsignedIntegerValue] y:[set[edge] doubleValue]];}
+- (NSClipView *)clipView {NSClipView *clip=(NSClipView *)self.pdf.documentView.superview;return [clip isKindOfClass:NSClipView.class]?clip:nil;}
+- (void)scrolled:(NSNotification *)note {[self refreshStrip];}
+- (void)refreshStrip {
+    if(!self.changeStrip||self.changeStrip.hidden)return;
+    NSClipView *clip=[self clipView];
+    if(clip&&clip!=self.watchedClip){
+        if(self.watchedClip)[[NSNotificationCenter defaultCenter]removeObserver:self name:NSViewBoundsDidChangeNotification object:self.watchedClip];
+        self.watchedClip=clip;clip.postsBoundsChangedNotifications=YES;
+        [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(scrolled:) name:NSViewBoundsDidChangeNotification object:clip];
+    }
+    BOOL any=self.pdf.document.pageCount>0;
+    self.changeStrip.visibleStart=any?[self fractionAtViewY:NSMaxY(self.pdf.bounds)]:0;self.changeStrip.visibleEnd=any?[self fractionAtViewY:NSMinY(self.pdf.bounds)]:0;
+    [self.changeStrip setNeedsDisplay:YES];
+}
+- (void)showChanges:(NSArray<NSArray<NSNumber *> *> *)marks {
+    NSMutableArray *ticks=[NSMutableArray new];
+    for(NSArray<NSNumber *> *mark in marks){NSUInteger page=mark[0].unsignedIntegerValue;[ticks addObject:@[@([self fractionForPage:page y:mark[1].doubleValue]),@([self fractionForPage:page y:mark[2].doubleValue]),mark[3]]];}
+    self.changeSets=DiffSets(marks);self.changeIndex=-1;
+    self.changeStrip.marks=ticks;self.changeStrip.currentStart=self.changeStrip.currentEnd=0;
+    self.previousChangeButton.enabled=self.nextChangeButton.enabled=self.changeSets.count>0;
+    [self refreshStrip];
+}
+- (BOOL)validateMenuItem:(NSMenuItem *)item {return item.action==@selector(previousChange:)||item.action==@selector(nextChange:)?self.changeSets.count>0:YES;}
+- (void)showPage:(NSUInteger)index y:(CGFloat)y {
+    PDFDocument *document=self.pdf.document;if(index>=document.pageCount)return;
+    PDFPage *page=[document pageAtIndex:index];NSClipView *clip=[self clipView];CGFloat x=clip?clip.bounds.origin.x:0;
+    [self.pdf goToPage:page];[self.pdf layoutDocumentView];
+    NSView *view=self.pdf.documentView;clip=[self clipView];if(!clip)return;
+    NSPoint actual=[self.pdf convertPoint:NSMakePoint(NSMinX([page boundsForBox:self.pdf.displayBox]),y) fromPage:page];
+    NSPoint from=[view convertPoint:actual fromView:self.pdf],to=[view convertPoint:NSMakePoint(actual.x,NSMaxY(self.pdf.bounds)-self.pdf.bounds.size.height*ChangeLine) fromView:self.pdf];
+    NSPoint origin=NSMakePoint(x,clip.bounds.origin.y+from.y-to.y);
+    [clip scrollToPoint:[clip constrainBoundsRect:(NSRect){origin,clip.bounds.size}].origin];[(NSScrollView *)clip.superview reflectScrolledClipView:clip];
+}
+- (void)showChange:(NSInteger)index {
+    if(index<0||index>=(NSInteger)self.changeSets.count)return;
+    NSDictionary *set=self.changeSets[index];
+    [self showPage:[set[@"page"] unsignedIntegerValue] y:[set[@"top"] doubleValue]];
+    self.changeIndex=index;
+    self.changeStrip.currentStart=[self fractionOfSet:index edge:@"top"];self.changeStrip.currentEnd=[self fractionOfSet:index edge:@"bottom"];
+    [self pageChanged:nil];self.status.stringValue=[self updatedStatus];
+}
+// 文言：所至之处犹在目前，则循序而行；否则自目前所见者始，首尾相续。
+// 汉语：刚到过的那一处还在视口内，就按次序到下一处或上一处。否则“下一处”取视口上缘以下的第一处（已在视口内的改动优先，
+// 刚做的修改通常就在眼前），“上一处”取完全在视口上缘以上的最后一处。首尾循环。
+- (void)stepChange:(NSInteger)step {
+    NSInteger count=self.changeSets.count,index;if(!count||!self.pdf.document)return;
+    double top=[self fractionAtViewY:NSMaxY(self.pdf.bounds)],bottom=[self fractionAtViewY:NSMinY(self.pdf.bounds)];
+    if(self.changeIndex>=0&&self.changeIndex<count&&[self fractionOfSet:self.changeIndex edge:@"bottom"]>top&&[self fractionOfSet:self.changeIndex edge:@"top"]<bottom)index=(self.changeIndex+step+count)%count;
+    else if(step>0){index=0;for(NSInteger i=0;i<count;i++)if([self fractionOfSet:i edge:@"bottom"]>top){index=i;break;}}
+    else {index=count-1;for(NSInteger i=count-1;i>=0;i--)if([self fractionOfSet:i edge:@"bottom"]<=top){index=i;break;}}
+    [self showChange:index];
+}
+- (void)previousChange:(id)sender {[self stepChange:-1];}
+- (void)nextChange:(id)sender {[self stepChange:1];}
+// 文言：击条则至其处；近于改处者，径至该处。汉语：点在某处改动的标记上（4 像素以内）就跳到那一处，否则跳到相应的文档位置。
+- (void)stripClicked:(double)fraction {
+    PDFDocument *document=self.pdf.document;NSUInteger pages=document.pageCount;if(!pages)return;
+    CGFloat height=self.changeStrip.bounds.size.height;double reach=height>0?4/height:0;NSInteger nearest=-1;
+    for(NSInteger i=0;i<(NSInteger)self.changeSets.count;i++){
+        double top=[self fractionOfSet:i edge:@"top"],bottom=[self fractionOfSet:i edge:@"bottom"],distance=fraction<top?top-fraction:fraction>bottom?fraction-bottom:0;
+        if(distance<=reach){reach=distance;nearest=i;}
+    }
+    if(nearest>=0){[self showChange:nearest];return;}
+    double position=MIN(fraction*pages,pages-1e-6);NSUInteger index=(NSUInteger)position;NSRect box=[[document pageAtIndex:index] boundsForBox:self.pdf.displayBox];
+    [self showPage:index y:NSMaxY(box)-(position-index)*box.size.height];
+    self.changeIndex=-1;self.changeStrip.currentStart=self.changeStrip.currentEnd=0;[self pageChanged:nil];self.status.stringValue=[self updatedStatus];
 }
 - (void)toggleDiff:(id)sender {
     DiffHints=!DiffHints;if(!Background())[NSUserDefaults.standardUserDefaults setBool:DiffHints forKey:@"HighlightChanges"];
-    for(Viewer *viewer in Windows){viewer.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;[viewer rebuildDiff];if(viewer.pdf.document)viewer.status.stringValue=[viewer updatedStatus];}
+    for(Viewer *viewer in Windows){viewer.diffItem.state=DiffHints?NSControlStateValueOn:NSControlStateValueOff;[viewer rebuildDiff];[viewer layoutJumpControls];if(viewer.fit)[viewer fitWidth:nil];if(viewer.pdf.document)viewer.status.stringValue=[viewer updatedStatus];}
 }
 
 // 文言：诸成卷皆藏内存，换览不覆原卷。汉语：保留每次成功加载的内容变更；不淘汰旧快照，不写回 PDF。
@@ -476,8 +610,8 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
 }
 - (void)layoutJumpControls {
     if(!self.jumpBar)return;
-    NSSize size=self.window.contentView.bounds.size;BOOL showHistory=self.history.count>1;
-    CGFloat historyWidth=showHistory?110:0,pointWidth=self.jumpPoints.count?self.jumpContentWidth+8:0;
+    NSSize size=self.window.contentView.bounds.size;BOOL showHistory=self.history.count>1,showChanges=showHistory&&DiffHints;
+    CGFloat historyWidth=showHistory?(showChanges?160:110):0,pointWidth=self.jumpPoints.count?self.jumpContentWidth+8:0;
     self.toolbarOverflow=size.width<440+historyWidth+pointWidth+256;
     // Regular-height buttons and a taller scroll viewport avoid macOS 27 bezel clipping.
     CGFloat top=size.height-42,row=self.toolbarOverflow?top-42:top;
@@ -486,6 +620,8 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     CGFloat start=self.toolbarOverflow?12:440;
     self.previousVersionButton.hidden=!showHistory;self.latestVersionButton.hidden=!showHistory;self.nextVersionButton.hidden=!showHistory;
     self.previousVersionButton.frame=NSMakeRect(start,row,22,32);self.latestVersionButton.frame=NSMakeRect(start+24,row,54,32);self.nextVersionButton.frame=NSMakeRect(start+80,row,22,32);
+    self.previousChangeButton.hidden=!showChanges;self.nextChangeButton.hidden=!showChanges;
+    self.previousChangeButton.frame=NSMakeRect(start+106,row,22,32);self.nextChangeButton.frame=NSMakeRect(start+130,row,22,32);
     start+=historyWidth;
     CGFloat available=MAX(0,size.width-start-12),width=self.jumpPoints.count?MIN(self.jumpContentWidth,self.toolbarOverflow?available:MAX(0,available-256)):0;
     self.jumpBar.hidden=self.jumpPoints.count==0;self.jumpBar.frame=NSMakeRect(start,row-4,width,40);
@@ -493,7 +629,9 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     CGFloat searchX=self.toolbarOverflow?440:start+width+(self.jumpPoints.count?8:0);
     self.search.frame=NSMakeRect(searchX,top+4,MAX(0,size.width-searchX-76),24);
     self.previousSearchButton.frame=NSMakeRect(size.width-72,top,28,32);self.nextSearchButton.frame=NSMakeRect(size.width-40,top,28,32);
-    self.pdf.frame=NSMakeRect(0,30,size.width,MAX(0,size.height-30-(self.toolbarOverflow?94:52)));
+    CGFloat strip=DiffHints?StripWidth:0,height=MAX(0,size.height-30-(self.toolbarOverflow?94:52));
+    self.changeStrip.hidden=!DiffHints;self.changeStrip.frame=NSMakeRect(0,30,strip,height);
+    self.pdf.frame=NSMakeRect(strip,30,MAX(0,size.width-strip),height);[self refreshStrip];
 }
 - (void)jumpButton:(NSButton *)sender {NSMenuItem *item=[NSMenuItem new];item.representedObject=sender.identifier;[self jumpToPoint:item];}
 - (void)quickSetJumpPoint:(id)sender {if(self.pdf.document)[self queueJumpName:@"" snapshot:[self jumpSnapshot]];}
@@ -631,9 +769,22 @@ static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY
     if([op isEqual:@"jump"]||[op isEqual:@"removeJump"]){NSMenuItem *item=[NSMenuItem new];item.representedObject=a[0];if([op isEqual:@"jump"])[self jumpToPoint:item];else [self removeJumpPoint:item];return @0;}
     if([op isEqual:@"testPointScroll"]){CGEventRef event=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitPixel,2,0,-300);[self.jumpBar scrollWheel:[NSEvent eventWithCGEvent:event]];CFRelease(event);return @0;}
     if([op isEqual:@"testSize"]){[self.window setContentSize:NSMakeSize([a[0] doubleValue],[a[1] doubleValue])];[self layoutJumpControls];return @0;}
-    if([op isEqual:@"inspectToolbar"]){NSMutableArray *frames=[NSMutableArray new];NSMutableArray *controls=[self.baseButtons mutableCopy];[controls addObjectsFromArray:@[self.pageField,self.setJumpButton,self.search,self.previousSearchButton,self.nextSearchButton]];if(self.history.count>1)[controls addObjectsFromArray:@[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]];for(NSView *view in controls)[frames addObject:NSStringFromRect(view.frame)];return @{@"overflow":@(self.toolbarOverflow),@"frames":frames,@"bounds":NSStringFromRect(self.window.contentView.bounds),@"pdf":NSStringFromRect(self.pdf.frame),@"scrollHeight":@(self.jumpBar.contentSize.height),@"scrollX":@(self.jumpBar.contentView.bounds.origin.x),@"pointHeight":@(self.jumpBar.documentView.subviews.firstObject.frame.size.height),@"searchWidth":@(self.search.frame.size.width)};}
+    if([op isEqual:@"inspectToolbar"]){NSMutableArray *frames=[NSMutableArray new];NSMutableArray *controls=[self.baseButtons mutableCopy];[controls addObjectsFromArray:@[self.pageField,self.setJumpButton,self.search,self.previousSearchButton,self.nextSearchButton]];if(self.history.count>1)[controls addObjectsFromArray:@[self.previousVersionButton,self.latestVersionButton,self.nextVersionButton]];if(!self.previousChangeButton.hidden)[controls addObjectsFromArray:@[self.previousChangeButton,self.nextChangeButton]];for(NSView *view in controls)[frames addObject:NSStringFromRect(view.frame)];return @{@"overflow":@(self.toolbarOverflow),@"frames":frames,@"bounds":NSStringFromRect(self.window.contentView.bounds),@"pdf":NSStringFromRect(self.pdf.frame),@"scrollHeight":@(self.jumpBar.contentSize.height),@"scrollX":@(self.jumpBar.contentView.bounds.origin.x),@"pointHeight":@(self.jumpBar.documentView.subviews.firstObject.frame.size.height),@"searchWidth":@(self.search.frame.size.width)};}
     if([op isEqual:@"testSearch"]){self.search.stringValue=a[0];[self controlTextDidChange:[NSNotification notificationWithName:NSControlTextDidChangeNotification object:self.search]];return @0;}
     if([op isEqual:@"testSearchStep"]){if([a[0] integerValue]<0)[self.previousSearchButton performClick:nil];else [self.nextSearchButton performClick:nil];return @0;}
+    if([op isEqual:@"testChangeStep"]){[[a[0] integerValue]<0?self.previousChangeButton:self.nextChangeButton performClick:nil];return @0;}
+    if([op isEqual:@"testChangeMenu"]){NSMenuItem *item=[a[0] integerValue]<0?self.previousChangeItem:self.nextChangeItem;if([self validateMenuItem:item])[NSApp sendAction:item.action to:item.target from:item];return @0;}
+    if([op isEqual:@"testChangeShortcut"]){BOOL down=[a[0] integerValue]>0;NSString *key=[NSString stringWithFormat:@"%C",(unichar)(down?NSDownArrowFunctionKey:NSUpArrowFunctionKey)];
+        NSEvent *event=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand|NSEventModifierFlagOption|NSEventModifierFlagFunction|NSEventModifierFlagNumericPad timestamp:0 windowNumber:self.window.windowNumber context:nil characters:key charactersIgnoringModifiers:key isARepeat:NO keyCode:down?125:126];
+        return @([self.menuBar performKeyEquivalent:event]);}
+    if([op isEqual:@"testStripClick"]){[self stripClicked:[a[0] doubleValue]];return @0;}
+    if([op isEqual:@"inspectChanges"]){NSMutableArray *sets=[NSMutableArray new];double line=-1;
+        for(NSInteger i=0;i<(NSInteger)self.changeSets.count;i++){NSMutableDictionary *set=[self.changeSets[i] mutableCopy];set[@"fraction"]=@([self fractionOfSet:i edge:@"top"]);[sets addObject:set];}
+        if(self.changeIndex>=0&&self.changeIndex<(NSInteger)self.changeSets.count&&self.pdf.bounds.size.height>0){NSDictionary *set=self.changeSets[self.changeIndex];PDFPage *page=[self.pdf.document pageAtIndex:[set[@"page"] unsignedIntegerValue]];
+            line=(NSMaxY(self.pdf.bounds)-[self.pdf convertPoint:NSMakePoint(NSMinX([page boundsForBox:self.pdf.displayBox]),[set[@"top"] doubleValue]) fromPage:page].y)/self.pdf.bounds.size.height;}
+        return @{@"sets":sets,@"index":@(self.changeIndex),@"line":@(line),@"marks":self.changeStrip.marks?:@[],@"visible":@[@(self.changeStrip.visibleStart),@(self.changeStrip.visibleEnd)],@"current":@[@(self.changeStrip.currentStart),@(self.changeStrip.currentEnd)],
+            @"stripHidden":@(self.changeStrip.hidden),@"strip":NSStringFromRect(self.changeStrip.frame),@"pdf":NSStringFromRect(self.pdf.frame),@"buttonsHidden":@(self.previousChangeButton.hidden&&self.nextChangeButton.hidden),
+            @"enabled":@(self.previousChangeButton.enabled&&self.nextChangeButton.enabled),@"menuEnabled":@([self validateMenuItem:self.nextChangeItem]),@"scrollX":@([self clipView].bounds.origin.x)};}
     if([op isEqual:@"testDiff"]){if(DiffHints!=[a[0] boolValue])[self toggleDiff:nil];return @0;}
     if([op isEqual:@"testDiffMenu"]){[NSApp sendAction:self.diffItem.action to:self.diffItem.target from:self.diffItem];return @0;}
     if([op isEqual:@"inspectDiff"]){NSMutableArray *texts=[NSMutableArray new];NSUInteger shown=0;

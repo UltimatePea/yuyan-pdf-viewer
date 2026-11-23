@@ -64,12 +64,14 @@ static NSData *TokensAs(NSArray<NSString *> *pages,BOOL stretched){
         while(start<text.length){
             NSRange end=[text rangeOfString:@"\n" options:0 range:NSMakeRange(start,text.length-start)];NSUInteger next=end.location==NSNotFound?text.length:end.location+1;
             TestLine *line=[[TestLine alloc]initWithDocument:document];line.range=NSMakeRange(start,next-start);
-            [words addLine:line page:page index:index text:text y:y];start=next;y-=12;
+            [words addLine:line page:page index:index text:text box:NSMakeRect(72,y,400,12)];start=next;y-=12;
         }
     }];
     return [words finish];
 }
 static NSData *Tokens(NSArray<NSString *> *pages){return TokensAs(pages,NO);}
+// Runs as [page, start, length], without their vertical extent.
+static NSArray *Spans(NSArray<NSArray<NSNumber *> *> *runs){NSMutableArray *out=[NSMutableArray new];for(NSArray *run in runs)[out addObject:[run subarrayWithRange:NSMakeRange(0,3)]];return out;}
 static NSString *Marked(NSArray<NSString *> *pages,NSData *tokens,NSData *flags){
     const DiffToken *t=tokens.bytes;const uint8_t *f=flags.bytes;NSMutableArray *out=[NSMutableArray new];
     for(NSUInteger i=0;i<flags.length;i++)if(f[i])[out addObject:[Plain(pages[t[i].page]) substringWithRange:NSMakeRange(t[i].loc,t[i].len)]];
@@ -173,7 +175,7 @@ int main(void){@autoreleasepool{
     // The character beside a glued number has no reliable position: it is left out of the highlight, which ends there.
     after=@[@"see alpha beta‹7›\ngamma delta\n"];newTokens=TokensAs(after,YES);diff=DiffCompute(Tokens(@[@"see\n"]),newTokens,nil,nil);
     NSArray *expected=@[@[@0,@4,@9],@[@0,@16,@11]];
-    Check([DiffRuns(newTokens,diff[@"new"]) isEqual:expected]&&[diff[@"added"] isEqual:@4],@"a highlight stops before the character that touches a glued margin number");
+    Check([Spans(DiffRuns(newTokens,diff[@"new"])) isEqual:expected]&&[diff[@"added"] isEqual:@4],@"a highlight stops before the character that touches a glued margin number");
     before=@[@"Chapter 4‹748›\nopens here ‹749›\n"];after=@[@"Chapter 4‹751›\nopens here ‹752›\n"];
     diff=DiffCompute(TokensAs(before,YES),TokensAs(after,YES),nil,nil);
     Check([diff[@"deleted"] isEqual:@0]&&[diff[@"added"] isEqual:@0],@"a margin number glued to a number of the text is not a change");
@@ -206,6 +208,17 @@ int main(void){@autoreleasepool{
     // Adjacent changed words on one page form one highlight; an ignored number between them splits it.
     after=@[@"one two\nthree\n12\nfour\n",@"five\n"];newTokens=Tokens(after);diff=DiffCompute([NSData data],newTokens,nil,nil);
     expected=@[@[@0,@0,@13],@[@0,@17,@4],@[@1,@0,@4]];
-    Check([DiffRuns(newTokens,diff[@"new"]) isEqual:expected],@"adjacent changed words merge into one highlight per page, split at margin numbers");
+    Check([Spans(DiffRuns(newTokens,diff[@"new"])) isEqual:expected],@"adjacent changed words merge into one highlight per page, split at margin numbers");
+    // A run reports the lines it covers: the harness sets lines 12pt apart, the first with its top at 712.
+    after=@[@"one two\nthree\nfour five\n"];newTokens=Tokens(after);diff=DiffCompute(Tokens(@[@"one five\n"]),newTokens,nil,nil);
+    NSArray<NSArray<NSNumber *> *> *extent=DiffRuns(newTokens,diff[@"new"]);
+    Check(extent.count==1&&[extent[0][3] isEqual:@712]&&[extent[0][4] isEqual:@676]&&[Spans(extent) isEqual:(@[@[@0,@4,@14]])],@"a run reports the top of its first line and the bottom of its last");
+    // Sets of changes: ranges on one page that lie within 30pt of each other form one set; sets run by page, then from the top down.
+    NSArray *marks=@[@[@2,@300,@288,@YES],@[@0,@700,@688,@NO],@[@0,@650,@638,@NO],@[@0,@684,@672,@YES],@[@0,@500,@488,@NO],@[@2,@330,@318,@NO]];
+    NSArray<NSDictionary *> *sets=DiffSets(marks);
+    NSArray *wanted=@[@{@"page":@0,@"top":@700,@"bottom":@638,@"added":@2,@"deleted":@1},@{@"page":@0,@"top":@500,@"bottom":@488,@"added":@1,@"deleted":@0},@{@"page":@2,@"top":@330,@"bottom":@288,@"added":@1,@"deleted":@1}];
+    Check([sets isEqual:wanted],@"nearby changes on a page form one set, ordered by page and from the top down");
+    Check(!DiffSets(@[]).count&&DiffSets(@[@[@1,@100,@90,@NO],@[@1,@59,@50,@NO]]).count==2&&DiffSets(@[@[@1,@100,@90,@NO],@[@1,@60,@50,@NO]]).count==1,@"changes more than 30pt apart are separate sets");
+    Check(sizeof(DiffToken)==24,@"a word takes 24 bytes");
     printf("{\"passed\":%d}\n",Passed);
 }}

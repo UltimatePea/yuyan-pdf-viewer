@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.7-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.8-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -28,6 +28,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.7-macos-arm64.zip`, then open `阅卷.app` or move 
 - Persistent jump points with direct top-bar buttons, optional names, and keyboard shortcuts.
 - In-memory PDF version history with Previous, Next and Latest navigation.
 - Change highlights between consecutive versions: added words in green, words the next version deletes in red. On by default; **View → Highlight Changes** turns them off.
+- An overview bar along the left edge marks where the changes are in the whole document, and **↑ / ↓** buttons step through them.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.
 
 Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content can fall back to the original page coordinates.
@@ -53,6 +54,12 @@ Each version is compared with its neighbours, word by word. Words **added** sinc
 - A rebuild that changes no words is passed over. Each version is compared with the nearest earlier and the nearest later version whose words differ, so a rebuild without edits keeps the highlights of the last change.
 - Change highlights and search highlights are shown together, and are rebuilt after refreshes, version changes and reopening a document. They use the extracted text only and never modify the PDF.
 - Each snapshot in the history also keeps its word list, about 24 bytes per word.
+
+**Overview bar.** A narrow bar along the left edge of the window stands for the whole document from top to bottom, like a scrollbar with marks. Green marks on its right half are additions; red marks on its left half are deletions by the next version. A grey block shows the part of the document in view. Click or drag on the bar to go to that place, or click a mark to go to that change.
+
+**Previous and next change.** The **↑** and **↓** buttons beside the version controls go to the previous and the next set of changes, as do **⌥⌘↑** and **⌥⌘↓** and the View menu. Changes on one page that lie within about two lines of each other form one set. A visited set is placed three tenths below the top of the view, the status bar shows its number, such as `Change 3/12`, and the bar outlines it. While the visited set is still in view, stepping goes on from it. Otherwise **↓** takes the first change at or below the top of the view, so a change already on screen comes first, and **↑** takes the last change above the view. Both wrap around.
+
+The bar and the two buttons are hidden while highlights are off.
 
 The comparison is heuristic. It follows the order in which PDFKit extracts text, so reordered columns, moved floats and formulas whose extracted text changes can be marked. A word that differs only by a hyphen is not marked. A number that opens or ends a line apart from its text, as in some tables, is treated as a line number, and a line that repeats at the top or bottom of three or more pages as a header or footer. Where PDFKit glues a margin number to the last word of a line, the highlight leaves out that word's last letter, whose position PDFKit misreports.
 
