@@ -33,8 +33,9 @@ static NSArray *Lines(PDFDocument *doc, NSUInteger *skipped, DiffWords *words) {
 static Viewer *V, *AppDelegate;
 static NSMutableArray<Viewer *> *Windows;
 static BOOL Quitting;
-static NSMutableDictionary *Histories,*DiffCache;
-static BOOL DiffHints=YES,RemoveAsks=YES;
+static NSMutableDictionary *Histories,*DiffCache,*OutlineStates;
+static BOOL DiffHints=YES,RemoveAsks=YES,OutlineShown=YES;
+static CGFloat OutlineWidth=260;
 static NSUInteger WindowSerial, PollIndex;
 static Viewer *OpenWindow(NSString *path);
 static BOOL Background(void) {return [NSProcessInfo.processInfo.environment[@"YY_VIEWER_BACKGROUND"] isEqual:@"1"]; }
@@ -112,7 +113,65 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 - (void)mouseDown:(NSEvent *)event {[self jump:event];}
 - (void)mouseDragged:(NSEvent *)event {[self jump:event];}
 @end
-@interface Viewer : NSObject <NSApplicationDelegate,NSWindowDelegate,NSSearchFieldDelegate,NSMenuItemValidation>
+// 文言：卷有纲目，列于左栏，击之则至，可隐。汉语：目录栏。PDF 自带的目录（书签）列在窗口左侧，一列标题、一列页码；点击即跳到该处，
+// 所读之处所在的条目随滚动而选中。View → Outline（⌃⌘S）显示或隐藏，对所有窗口生效并记住；没有目录的文档不显示此栏。右缘可拖动以调整宽度。
+// 每次换文档都从 PDFKit 的目录重建一棵自己的节点树：节点身份稳定，位置与页码只算一次。展开状态以标题路径为键留存，重编译之后不变；
+// 用户没有动过的条目，顶层默认展开，其余依 PDF 自己的设定。
+static const CGFloat OutlineEdgeWidth=6,OutlineLeast=140,OutlineMost=480,OutlineReserve=360,OutlineSlack=12;
+static const NSInteger OutlineDepth=32;
+static const NSUInteger OutlineLimit=20000;
+@interface OutlineNode : NSObject
+@property NSString *title,*label,*key;
+@property NSInteger page,level;
+@property CGFloat y;
+@property double fraction;
+@property BOOL open;
+@property NSArray<OutlineNode *> *children;
+@property (weak) OutlineNode *parent;
+@end
+@implementation OutlineNode
+@end
+// page 为 -1 表示条目没有可跳转的目的地。y 是页坐标中的上缘；目的地未指定纵坐标（如 /Fit）时取页顶。key 是自根而下的标题路径，同名的兄弟以序号区分。
+static NSArray<OutlineNode *> *OutlineBuild(PDFOutline *above,PDFDocument *document,OutlineNode *parent,NSInteger level,NSUInteger *budget) {
+    NSMutableArray<OutlineNode *> *list=[NSMutableArray new];NSCountedSet *seen=[NSCountedSet new];
+    for(NSUInteger i=0;i<above.numberOfChildren&&*budget;i++){
+        PDFOutline *item=[above childAtIndex:i];if(!item)continue;(*budget)--;
+        OutlineNode *node=[OutlineNode new];node.title=item.label?:@"";node.level=level;node.parent=parent;node.open=item.isOpen;node.page=-1;node.label=@"";
+        [seen addObject:node.title];node.key=[NSString stringWithFormat:@"%@\n%@#%lu",parent.key?:@"",node.title,(unsigned long)[seen countForObject:node.title]];
+        PDFDestination *destination=item.destination;if(!destination&&[item.action isKindOfClass:PDFActionGoTo.class])destination=((PDFActionGoTo *)item.action).destination;
+        PDFPage *page=destination.page;NSUInteger index=page?[document indexForPage:page]:NSNotFound;
+        if(index!=NSNotFound&&index<document.pageCount){
+            NSRect box=[page boundsForBox:kPDFDisplayBoxCropBox];CGFloat y=destination.point.y;
+            node.page=(NSInteger)index;node.y=!isfinite(y)||y>=kPDFDestinationUnspecifiedValue?NSMaxY(box):MAX(NSMinY(box),MIN(NSMaxY(box),y));
+            node.label=page.label.length?page.label:[NSString stringWithFormat:@"%lu",(unsigned long)index+1];
+        }
+        node.children=level+1<OutlineDepth?OutlineBuild(item,document,node,level+1,budget):@[];
+        [list addObject:node];
+    }
+    return list;
+}
+// 文言：开阖必经此二法，故于此记之。汉语：用户点击展开三角与程序调用都经过这两个方法，在这里报告被操作的那一个条目。
+// 不用展开、折叠通知：折叠一个条目时，其下已展开的各条目也会收到折叠通知，而它们的状态应当保留，重新展开时照旧。
+@interface OutlineList : NSOutlineView
+@property (copy) void (^toggled)(id item,BOOL open,BOOL children);
+@end
+@implementation OutlineList
+- (void)expandItem:(id)item expandChildren:(BOOL)children {[super expandItem:item expandChildren:children];if(self.toggled)self.toggled(item,YES,children);}
+- (void)collapseItem:(id)item collapseChildren:(BOOL)children {[super collapseItem:item collapseChildren:children];if(self.toggled)self.toggled(item,NO,children);}
+@end
+// 目录栏右缘：一条分隔线，可左右拖动以调整栏宽。
+@interface OutlineEdge : NSView
+@property (copy) void (^dragged)(CGFloat x,BOOL finished);
+@end
+@implementation OutlineEdge
+- (void)drawRect:(NSRect)dirty {[NSColor.separatorColor setFill];NSRectFillUsingOperation(NSMakeRect(NSMaxX(self.bounds)-1,0,1,self.bounds.size.height),NSCompositingOperationSourceOver);}
+- (void)resetCursorRects {[self addCursorRect:self.bounds cursor:NSCursor.resizeLeftRightCursor];}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {return YES;}
+- (void)mouseDown:(NSEvent *)event {}
+- (void)mouseDragged:(NSEvent *)event {if(self.dragged)self.dragged(event.locationInWindow.x,NO);}
+- (void)mouseUp:(NSEvent *)event {if(self.dragged)self.dragged(event.locationInWindow.x,YES);}
+@end
+@interface Viewer : NSObject <NSApplicationDelegate,NSWindowDelegate,NSSearchFieldDelegate,NSMenuItemValidation,NSOutlineViewDataSource,NSOutlineViewDelegate>
 @property NSWindow *window;
 @property NSMenu *menuBar,*windowMenu;
 @property NSNumber *cycleDestination;
@@ -147,6 +206,15 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 @property NSArray<NSDictionary *> *changeSets;
 @property NSInteger changeIndex;
 @property (weak) NSClipView *watchedClip;
+@property NSScrollView *outlineScroll;
+@property OutlineList *outlineView;
+@property OutlineEdge *outlineEdge;
+@property NSMenuItem *outlineItem;
+@property NSArray<OutlineNode *> *outlineNodes,*outlineOrder;
+@property OutlineNode *outlinePinned;
+@property NSString *outlinePinnedPlace;
+@property BOOL outlineBusy,outlineHold;
+@property NSString *outlineKept;
 @property PDFDocument *candidate;
 @property NSString *candidateDigest;
 @property NSMutableArray *events;
@@ -222,6 +290,7 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     self.previousChangeItem=[self item:@"Previous Change" action:@selector(previousChange:) key:[NSString stringWithFormat:@"%C",(unichar)NSUpArrowFunctionKey] menu:view];
     self.nextChangeItem=[self item:@"Next Change" action:@selector(nextChange:) key:[NSString stringWithFormat:@"%C",(unichar)NSDownArrowFunctionKey] menu:view];
     self.previousChangeItem.keyEquivalentModifierMask=self.nextChangeItem.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagOption;
+    self.outlineItem=[self item:@"Outline" action:@selector(toggleOutline:) key:@"s" menu:view];self.outlineItem.keyEquivalentModifierMask=NSEventModifierFlagCommand|NSEventModifierFlagControl;self.outlineItem.state=OutlineShown?NSControlStateValueOn:NSControlStateValueOff;
     self.jumpPoints=[NSMutableArray new];
     self.jumpMenu=[[NSMenu alloc]initWithTitle:@"Jump Points"];
     [bar addItemWithTitle:@"Jump Points" action:nil keyEquivalent:@""].submenu=self.jumpMenu;
@@ -240,6 +309,17 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     self.changeStrip=[[ChangeStrip alloc]initWithFrame:NSMakeRect(0,30,StripWidth,744)];self.changeStrip.autoresizingMask=NSViewHeightSizable;self.changeIndex=-1;
     self.changeStrip.toolTip=@"Changes in this version: green is added, red is deleted by the next version. Click to go there.";[self.changeStrip setAccessibilityLabel:@"Changes overview"];
     __weak Viewer *weak=self;self.changeStrip.clicked=^(double fraction){[weak stripClicked:fraction];};[root addSubview:self.changeStrip];
+    self.outlineView=[[OutlineList alloc]initWithFrame:NSMakeRect(0,0,OutlineWidth,744)];self.outlineView.toggled=^(OutlineNode *node,BOOL open,BOOL children){[weak outlineToggled:node open:open children:children];};
+    NSTableColumn *titleColumn=[[NSTableColumn alloc]initWithIdentifier:@"title"],*pageColumn=[[NSTableColumn alloc]initWithIdentifier:@"page"];
+    pageColumn.width=pageColumn.minWidth=pageColumn.maxWidth=36;titleColumn.minWidth=60;titleColumn.resizingMask=NSTableColumnAutoresizingMask;pageColumn.resizingMask=NSTableColumnNoResizing;
+    [self.outlineView addTableColumn:titleColumn];[self.outlineView addTableColumn:pageColumn];self.outlineView.outlineTableColumn=titleColumn;
+    self.outlineView.headerView=nil;self.outlineView.style=NSTableViewStyleFullWidth;self.outlineView.columnAutoresizingStyle=NSTableViewFirstColumnOnlyAutoresizingStyle;self.outlineView.rowHeight=18;self.outlineView.indentationPerLevel=12;self.outlineView.backgroundColor=NSColor.clearColor;
+    // 不取键盘焦点：点击目录之后，方向键与空格仍然滚动正文。
+    self.outlineView.allowsMultipleSelection=NO;self.outlineView.allowsEmptySelection=YES;self.outlineView.refusesFirstResponder=YES;self.outlineView.allowsColumnReordering=NO;self.outlineView.allowsColumnResizing=NO;
+    self.outlineView.dataSource=self;self.outlineView.delegate=self;self.outlineView.target=self;self.outlineView.action=@selector(outlineClicked:);[self.outlineView setAccessibilityLabel:@"Outline"];
+    self.outlineScroll=[[NSScrollView alloc]initWithFrame:NSMakeRect(0,30,OutlineWidth-OutlineEdgeWidth,744)];self.outlineScroll.documentView=self.outlineView;self.outlineScroll.hasVerticalScroller=YES;self.outlineScroll.autohidesScrollers=YES;self.outlineScroll.borderType=NSNoBorder;self.outlineScroll.drawsBackground=NO;self.outlineScroll.automaticallyAdjustsContentInsets=NO;self.outlineScroll.contentInsets=NSEdgeInsetsMake(4,0,4,0);self.outlineScroll.hidden=YES;[root addSubview:self.outlineScroll];
+    self.outlineEdge=[[OutlineEdge alloc]initWithFrame:NSMakeRect(OutlineWidth-OutlineEdgeWidth,30,OutlineEdgeWidth,744)];self.outlineEdge.hidden=YES;self.outlineEdge.toolTip=@"Drag to resize the outline";
+    self.outlineEdge.dragged=^(CGFloat x,BOOL finished){[weak outlineDragged:x finished:finished];};[root addSubview:self.outlineEdge];
     CGFloat x=12;
     NSArray *titles=@[@"Open…",@"‹",@"›",@"−",@"+",@"Fit Width"];
     SEL actions[]={@selector(open:),@selector(previous:),@selector(next:),@selector(zoomOut:),@selector(zoomIn:),@selector(fitWidth:)};
@@ -267,7 +347,7 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     if(self==AppDelegate)[NSApp finishLaunching];if(!Background()){[self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}
 }
 - (void)about:(id)sender {NSAlert *a=[NSAlert new];a.messageText=@"阅卷";a.informativeText=@"Yuyan · Wasm-GC · V8\nNative PDFKit viewer for continuously rebuilt papers.";[a beginSheetModalForWindow:self.window completionHandler:nil];}
-- (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];[self refreshStrip];}
+- (void)pageChanged:(id)sender {if(self.pdf.document)self.pageField.stringValue=[NSString stringWithFormat:@"%lu",[self.pdf.document indexForPage:self.pdf.currentPage]+1];[self refreshStrip];[self trackOutline];}
 - (void)windowDidResize:(NSNotification *)n {[self layoutJumpControls];if(self.fit)[self fitWidth:nil];}
 - (void)windowDidBecomeKey:(NSNotification *)n {NSApp.mainMenu=self.menuBar;NSApp.windowsMenu=self.windowMenu;}
 - (void)cycleWindow:(NSInteger)step {
@@ -307,10 +387,10 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     dispatch_source_set_event_handler(self.fileWatch,^{if(session==self.session){[self armFileWatch];if(![self.events.lastObject[@"kind"] isEqual:@2])[self enqueue:2 generation:0];}});
     dispatch_source_set_cancel_handler(self.fileWatch,^{close(fd);});dispatch_resume(self.fileWatch);self.watchCount++;
 }
-- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;self.pdf.document=nil;[self rebuildDiff];[self rebuildSearch];self.lines=@[];[self clearCandidate];self.history=nil;self.versionIndex=-1;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self refreshVersionControls];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
+- (void)closeDocument:(id)sender {[self stopWatch];self.session++;self.path=nil;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;self.pdf.document=nil;[self rebuildDiff];[self rebuildOutline];[self rebuildSearch];self.lines=@[];[self clearCandidate];self.history=nil;self.versionIndex=-1;self.matchingJump=nil;self.jumpPoints=[NSMutableArray new];[self refreshJumpMenus];[self refreshVersionControls];[self.events removeAllObjects];[self enqueue:1 generation:0];self.status.stringValue=@"No document";self.window.title=@"阅卷 — PDF";}
 - (void)openPath:(NSString *)path {
     [self stopWatch];self.session++;self.path=path.stringByStandardizingPath;self.digest=nil;self.lastUpdated=nil;self.skippedTextLines=0;
-    self.pdf.document=nil;[self rebuildDiff];[self rebuildSearch];self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
+    self.pdf.document=nil;[self rebuildDiff];[self rebuildOutline];[self rebuildSearch];self.lines=@[];[self clearCandidate];[self.events removeAllObjects];
     self.history=self.histories[self.path];if(!self.history){self.history=[self storedHistory];self.histories[self.path]=self.history;}self.versionIndex=-1;
     self.matchingJump=nil;[self loadJumpPoints];[self refreshJumpMenus];
     self.window.title=[@"阅卷 — " stringByAppendingString:self.path.lastPathComponent];self.window.representedURL=[NSURL fileURLWithPath:self.path];
@@ -329,7 +409,7 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 - (void)zoomIn:(id)sender {self.fit=NO;[self.pdf zoomIn:sender];}
 - (void)zoomOut:(id)sender {self.fit=NO;[self.pdf zoomOut:sender];}
 - (void)fitWidth:(id)sender {self.fit=YES;PDFPage *p=self.pdf.currentPage?:[self.pdf.document pageAtIndex:0];if(p){NSRect r=[p boundsForBox:self.pdf.displayBox];self.pdf.scaleFactor=MAX(.05,(self.pdf.bounds.size.width-28)/r.size.width);}}
-- (void)setModePreservingPosition:(PDFDisplayMode)mode {[self capture];self.pdf.displayMode=mode;[self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];[self refreshStrip];}
+- (void)setModePreservingPosition:(PDFDisplayMode)mode {[self capture];self.pdf.displayMode=mode;[self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];[self refreshStrip];[self trackOutline];}
 - (void)mode:(id)sender {[self setModePreservingPosition:self.pdf.displayMode==kPDFDisplaySinglePageContinuous?kPDFDisplaySinglePage:kPDFDisplaySinglePageContinuous];}
 - (void)follow:(NSMenuItem *)sender {self.follow=!self.follow;sender.state=self.follow?NSControlStateValueOn:NSControlStateValueOff;}
 - (void)find:(id)sender {[self.window makeFirstResponder:self.search];}
@@ -420,11 +500,13 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 }
 - (void)commitLine:(NSInteger)line anchor:(NSInteger)anchor {
     if(!self.candidate)return;
+    // 换上新文档的那一刻正文先回到别处，目录栏不应跟着跳：先按住，提交完再定。
+    [self holdOutline];
     BOOL initial=self.pdf.document==nil;self.pdf.document=self.candidate;self.lines=self.candidateLines;self.digest=self.candidateDigest;self.lastUpdated=self.candidateTime;self.versionIndex=self.candidateVersionIndex;self.skippedTextLines=self.candidateSkippedTextLines;[self clearCandidate];self.commits++;
-    self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
+    [self rebuildOutline];self.pdf.displayMode=self.savedMode; if(initial||self.fit)[self fitWidth:nil];else self.pdf.scaleFactor=self.savedScale;
     if(!initial){if(line>=0&&line<self.lines.count){NSDictionary *l=self.lines[line];NSPoint off=anchor>=0&&anchor<self.anchors.count?NSPointFromString(self.anchors[anchor][@"offset"]):self.fallbackOffset;[self positionPage:[l[@"page"] integerValue] point:NSRectFromString(l[@"rect"]).origin offset:off];}else [self positionPage:self.fallbackPage point:self.fallbackPoint offset:self.fallbackOffset];}
     [self rebuildDiff];self.status.stringValue=[self updatedStatus];[self pageChanged:nil];
-    [self refreshJumpMenus];[self refreshVersionControls];[self rebuildSearch];
+    [self refreshJumpMenus];[self refreshVersionControls];[self rebuildSearch];[self releaseOutline];
     [self navigate];
 }
 
@@ -483,15 +565,16 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
 }
 - (double)fractionOfSet:(NSInteger)index edge:(NSString *)edge {NSDictionary *set=self.changeSets[index];return [self fractionForPage:[set[@"page"] unsignedIntegerValue] y:[set[edge] doubleValue]];}
 - (NSClipView *)clipView {NSClipView *clip=(NSClipView *)self.pdf.documentView.superview;return [clip isKindOfClass:NSClipView.class]?clip:nil;}
-- (void)scrolled:(NSNotification *)note {[self refreshStrip];}
+- (void)scrolled:(NSNotification *)note {[self refreshStrip];[self trackOutline];}
 - (void)refreshStrip {
-    if(!self.changeStrip||self.changeStrip.hidden)return;
+    // 概览条隐藏时目录栏仍要随滚动更新，故先登记滚动通知。
     NSClipView *clip=[self clipView];
     if(clip&&clip!=self.watchedClip){
         if(self.watchedClip)[[NSNotificationCenter defaultCenter]removeObserver:self name:NSViewBoundsDidChangeNotification object:self.watchedClip];
         self.watchedClip=clip;clip.postsBoundsChangedNotifications=YES;
         [[NSNotificationCenter defaultCenter]addObserver:self selector:@selector(scrolled:) name:NSViewBoundsDidChangeNotification object:clip];
     }
+    if(!self.changeStrip||self.changeStrip.hidden)return;
     BOOL any=self.pdf.document.pageCount>0;
     self.changeStrip.visibleStart=any?[self fractionAtViewY:NSMaxY(self.pdf.bounds)]:0;self.changeStrip.visibleEnd=any?[self fractionAtViewY:NSMinY(self.pdf.bounds)]:0;
     [self.changeStrip setNeedsDisplay:YES];
@@ -504,21 +587,21 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     self.previousChangeButton.enabled=self.nextChangeButton.enabled=self.changeSets.count>0;
     [self refreshStrip];
 }
-- (BOOL)validateMenuItem:(NSMenuItem *)item {return item.action==@selector(previousChange:)||item.action==@selector(nextChange:)?self.changeSets.count>0:YES;}
-- (void)showPage:(NSUInteger)index y:(CGFloat)y {
+- (BOOL)validateMenuItem:(NSMenuItem *)item {return item.action==@selector(previousChange:)||item.action==@selector(nextChange:)?self.changeSets.count>0:item.action==@selector(toggleOutline:)?self.outlineNodes.count>0:YES;}
+- (void)showPage:(NSUInteger)index y:(CGFloat)y line:(CGFloat)line {
     PDFDocument *document=self.pdf.document;if(index>=document.pageCount)return;
     PDFPage *page=[document pageAtIndex:index];NSClipView *clip=[self clipView];CGFloat x=clip?clip.bounds.origin.x:0;
     [self.pdf goToPage:page];[self.pdf layoutDocumentView];
     NSView *view=self.pdf.documentView;clip=[self clipView];if(!clip)return;
     NSPoint actual=[self.pdf convertPoint:NSMakePoint(NSMinX([page boundsForBox:self.pdf.displayBox]),y) fromPage:page];
-    NSPoint from=[view convertPoint:actual fromView:self.pdf],to=[view convertPoint:NSMakePoint(actual.x,NSMaxY(self.pdf.bounds)-self.pdf.bounds.size.height*ChangeLine) fromView:self.pdf];
+    NSPoint from=[view convertPoint:actual fromView:self.pdf],to=[view convertPoint:NSMakePoint(actual.x,NSMaxY(self.pdf.bounds)-self.pdf.bounds.size.height*line) fromView:self.pdf];
     NSPoint origin=NSMakePoint(x,clip.bounds.origin.y+from.y-to.y);
     [clip scrollToPoint:[clip constrainBoundsRect:(NSRect){origin,clip.bounds.size}].origin];[(NSScrollView *)clip.superview reflectScrolledClipView:clip];
 }
 - (void)showChange:(NSInteger)index {
     if(index<0||index>=(NSInteger)self.changeSets.count)return;
     NSDictionary *set=self.changeSets[index];
-    [self showPage:[set[@"page"] unsignedIntegerValue] y:[set[@"top"] doubleValue]];
+    [self showPage:[set[@"page"] unsignedIntegerValue] y:[set[@"top"] doubleValue] line:ChangeLine];
     self.changeIndex=index;
     self.changeStrip.currentStart=[self fractionOfSet:index edge:@"top"];self.changeStrip.currentEnd=[self fractionOfSet:index edge:@"bottom"];
     [self pageChanged:nil];self.status.stringValue=[self updatedStatus];
@@ -546,8 +629,99 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     }
     if(nearest>=0){[self showChange:nearest];return;}
     double position=MIN(fraction*pages,pages-1e-6);NSUInteger index=(NSUInteger)position;NSRect box=[[document pageAtIndex:index] boundsForBox:self.pdf.displayBox];
-    [self showPage:index y:NSMaxY(box)-(position-index)*box.size.height];
+    [self showPage:index y:NSMaxY(box)-(position-index)*box.size.height line:ChangeLine];
     self.changeIndex=-1;self.changeStrip.currentStart=self.changeStrip.currentEnd=0;[self pageChanged:nil];self.status.stringValue=[self updatedStatus];
+}
+// 文言：纲目之数、其开阖、所读之条与所至之处。汉语：目录栏的数据源、展开状态、当前条目与跳转。
+- (NSInteger)outlineView:(NSOutlineView *)view numberOfChildrenOfItem:(OutlineNode *)item {return item?item.children.count:self.outlineNodes.count;}
+- (id)outlineView:(NSOutlineView *)view child:(NSInteger)index ofItem:(OutlineNode *)item {return item?item.children[index]:self.outlineNodes[index];}
+- (BOOL)outlineView:(NSOutlineView *)view isItemExpandable:(OutlineNode *)item {return item.children.count>0;}
+- (NSView *)outlineView:(NSOutlineView *)view viewForTableColumn:(NSTableColumn *)column item:(OutlineNode *)item {
+    BOOL page=[column.identifier isEqual:@"page"];NSTextField *field=[view makeViewWithIdentifier:column.identifier owner:self];
+    if(!field){field=[NSTextField labelWithString:@""];field.identifier=column.identifier;field.lineBreakMode=NSLineBreakByTruncatingTail;field.font=[NSFont systemFontOfSize:page?11:12];
+        if(page){field.alignment=NSTextAlignmentRight;field.textColor=NSColor.secondaryLabelColor;}}
+    field.stringValue=page?item.label:item.title;field.toolTip=page?nil:item.title;return field;
+}
+- (BOOL)outlineWantsOpen:(OutlineNode *)node {NSNumber *chosen=self.path?OutlineStates[self.path][node.key]:nil;return chosen?chosen.boolValue:node.level==0||node.open;}
+- (void)openOutline:(NSArray<OutlineNode *> *)nodes {for(OutlineNode *node in nodes)if(node.children.count&&[self outlineWantsOpen:node]){[self.outlineView expandItem:node];[self openOutline:node.children];}}
+- (void)recordOutline:(NSArray<OutlineNode *> *)nodes open:(BOOL)open deep:(BOOL)deep into:(NSMutableDictionary *)state {
+    for(OutlineNode *node in nodes){if(node.children.count)state[node.key]=@(open);if(deep)[self recordOutline:node.children open:open deep:YES into:state];}
+}
+// node 为 nil 指全部顶层条目；children 为真（按住 Option 点击）时连同其下各层一并记下。
+- (void)outlineToggled:(OutlineNode *)node open:(BOOL)open children:(BOOL)children {
+    if(self.outlineBusy||!self.path)return;
+    NSMutableDictionary *state=OutlineStates[self.path];if(!state){state=[NSMutableDictionary new];OutlineStates[self.path]=state;}
+    [self recordOutline:node?@[node]:self.outlineNodes open:open deep:children into:state];
+    // 刚展开的条目之下，各子条目恢复各自记住的或默认的开阖。
+    if(open&&!children){self.outlineBusy=YES;[self openOutline:node?node.children:self.outlineNodes];self.outlineBusy=NO;}
+    [self trackOutline];
+}
+- (void)orderOutline:(NSArray<OutlineNode *> *)nodes into:(NSMutableArray<OutlineNode *> *)order {
+    for(OutlineNode *node in nodes){if(node.page>=0){node.fraction=[self fractionForPage:node.page y:node.y];[order addObject:node];}[self orderOutline:node.children into:order];}
+}
+- (void)rebuildOutline {
+    PDFDocument *document=self.pdf.document;NSUInteger budget=OutlineLimit;NSClipView *clip=self.outlineScroll.contentView;NSPoint scroll=clip.bounds.origin;
+    self.outlineNodes=document.outlineRoot?OutlineBuild(document.outlineRoot,document,nil,0,&budget):@[];self.outlinePinned=nil;self.outlinePinnedPlace=nil;
+    // 文言：依其在卷中之先后列之，以寻所读之条。汉语：有目的地的条目按文档位置排序（目录的顺序未必就是文档的顺序），供查找当前条目。
+    NSMutableArray<OutlineNode *> *order=[NSMutableArray new];[self orderOutline:self.outlineNodes into:order];
+    [order sortWithOptions:NSSortStable usingComparator:^NSComparisonResult(OutlineNode *a,OutlineNode *b){return a.fraction<b.fraction?NSOrderedAscending:a.fraction>b.fraction?NSOrderedDescending:NSOrderedSame;}];
+    self.outlineOrder=order;
+    self.outlineBusy=YES;[self.outlineView reloadData];[self openOutline:self.outlineNodes];self.outlineBusy=NO;
+    // 文言：栏之隐显有变，乃重排。汉语：只有目录栏需要出现或消失时才重新布局。换版本时布局必须在恢复阅读位置之后进行
+    // （工具栏可能随之折行，正文区域的高度会变），而目录栏的有无决定正文区域的宽度，必须在适配宽度之前确定。
+    if((OutlineShown&&self.outlineNodes.count>0)==self.outlineScroll.hidden)[self layoutJumpControls];
+    // 重编译不应让目录栏滚回顶部。
+    [clip scrollToPoint:[clip constrainBoundsRect:(NSRect){scroll,clip.bounds.size}].origin];[self.outlineScroll reflectScrolledClipView:clip];
+    [self trackOutline];
+}
+- (NSString *)outlinePlace {NSClipView *clip=[self clipView];PDFPage *page=self.pdf.currentPage;return [NSString stringWithFormat:@"%lu %@ %g %ld",page?[self.pdf.document indexForPage:page]:0,NSStringFromPoint(clip.bounds.origin),self.pdf.scaleFactor,(long)self.pdf.displayMode];}
+// 文言：所读之处，其前最近之条为今条；其条隐于阖者，则取其可见之祖。
+// 汉语：当前条目是视口上缘（略向下留出余量）以上最近的一条；它若藏在折叠的条目之下，就选中最近的可见祖先。刚点击过的条目在滚动之前一直保持选中：
+// 文档末尾滚不到顶，或紧跟着还有别的标题时，否则会立刻跳到另一条。
+// 换文档、调整栏宽时正文会经过若干中间位置：其间不跟随，事毕再定；所选仍是原来那一条时，不为它滚动目录栏。
+- (void)holdOutline {self.outlineKept=((OutlineNode *)[self.outlineView itemAtRow:self.outlineView.selectedRow]).key;self.outlineHold=YES;}
+- (void)releaseOutline {self.outlineHold=NO;[self trackOutline];}
+- (void)trackOutline {
+    if(self.outlineHold||!self.outlineScroll||self.outlineScroll.hidden)return;
+    NSString *kept=self.outlineKept;self.outlineKept=nil;
+    OutlineNode *current=nil;
+    if(self.outlinePinned&&[self.outlinePinnedPlace isEqual:[self outlinePlace]])current=self.outlinePinned;
+    else {self.outlinePinned=nil;self.outlinePinnedPlace=nil;
+        if(self.outlineOrder.count&&self.pdf.document.pageCount){
+            double at=[self fractionAtViewY:NSMaxY(self.pdf.bounds)-OutlineSlack];NSInteger low=0,high=(NSInteger)self.outlineOrder.count-1,found=-1;
+            while(low<=high){NSInteger middle=(low+high)/2;if(self.outlineOrder[middle].fraction<=at){found=middle;low=middle+1;}else high=middle-1;}
+            if(found>=0)current=self.outlineOrder[found];
+        }
+    }
+    NSInteger row=-1;for(OutlineNode *node=current;node&&row<0;node=node.parent)row=[self.outlineView rowForItem:node];
+    if(row==self.outlineView.selectedRow)return;
+    self.outlineBusy=YES;
+    if(row<0)[self.outlineView deselectAll:nil];
+    else {[self.outlineView selectRowIndexes:[NSIndexSet indexSetWithIndex:row] byExtendingSelection:NO];if(![((OutlineNode *)[self.outlineView itemAtRow:row]).key isEqual:kept])[self.outlineView scrollRowToVisible:row];}
+    self.outlineBusy=NO;
+}
+// 跳到条目所指之处，把它放在视口上缘。没有目的地的条目不跳，选中项回到所读之处。
+- (void)showOutlineRow:(NSInteger)row {
+    OutlineNode *node=row>=0&&row<self.outlineView.numberOfRows?[self.outlineView itemAtRow:row]:nil;
+    if(node&&node.page>=0&&node.page<(NSInteger)self.pdf.document.pageCount){[self showPage:node.page y:node.y line:0];self.outlinePinned=node;self.outlinePinnedPlace=[self outlinePlace];}
+    [self pageChanged:nil];
+}
+- (void)outlineClicked:(id)sender {[self showOutlineRow:self.outlineView.clickedRow];}
+// 目录栏出现、消失或改变宽度时正文区域的宽度随之改变；适合宽度模式下缩放也变，故以所读之处为准重新定位。
+- (void)relayoutKeepingPosition {
+    BOOL any=self.pdf.document.pageCount>0;if(any)[self capture];[self holdOutline];
+    [self layoutJumpControls];if(self.fit)[self fitWidth:nil];
+    if(any)[self positionPage:self.fallbackPage point:self.fallbackPoint offset:NSMakePoint(NSMidX(self.pdf.bounds),NSMaxY(self.pdf.bounds)-self.pdf.bounds.size.height*.35)];
+    [self pageChanged:nil];[self releaseOutline];
+}
+- (void)toggleOutline:(id)sender {
+    OutlineShown=!OutlineShown;if(!Background())[NSUserDefaults.standardUserDefaults setBool:OutlineShown forKey:@"ShowOutline"];
+    for(Viewer *viewer in Windows){viewer.outlineItem.state=OutlineShown?NSControlStateValueOn:NSControlStateValueOff;if(viewer.outlineNodes.count){[viewer relayoutKeepingPosition];if(OutlineShown&&viewer.outlineView.selectedRow>=0)[viewer.outlineView scrollRowToVisible:viewer.outlineView.selectedRow];}}
+}
+- (void)outlineDragged:(CGFloat)x finished:(BOOL)finished {
+    CGFloat width=MAX(OutlineLeast,MIN(OutlineMost,round(x+OutlineEdgeWidth/2)));
+    if(width!=OutlineWidth){OutlineWidth=width;for(Viewer *viewer in Windows)if(viewer.outlineNodes.count&&OutlineShown)[viewer relayoutKeepingPosition];}
+    if(finished&&!Background())[NSUserDefaults.standardUserDefaults setDouble:OutlineWidth forKey:@"OutlineWidth"];
 }
 - (void)toggleDiff:(id)sender {
     DiffHints=!DiffHints;if(!Background())[NSUserDefaults.standardUserDefaults setBool:DiffHints forKey:@"HighlightChanges"];
@@ -791,8 +965,14 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
     self.search.frame=NSMakeRect(searchX,top+4,MAX(0,size.width-searchX-76),24);
     self.previousSearchButton.frame=NSMakeRect(size.width-72,top,28,32);self.nextSearchButton.frame=NSMakeRect(size.width-40,top,28,32);
     CGFloat strip=DiffHints?StripWidth:0,height=MAX(0,size.height-30-(self.toolbarOverflow?94:52));
-    self.changeStrip.hidden=!DiffHints;self.changeStrip.frame=NSMakeRect(0,30,strip,height);
-    self.pdf.frame=NSMakeRect(strip,30,MAX(0,size.width-strip),height);[self refreshStrip];
+    // 目录栏在最左，其右是概览条，再右是正文。窗口很窄时栏宽让位于正文，但不小于下限。
+    BOOL outline=OutlineShown&&self.outlineNodes.count>0;CGFloat side=outline?MAX(OutlineLeast,MIN(OutlineWidth,size.width-OutlineReserve)):0;
+    self.outlineScroll.hidden=self.outlineEdge.hidden=!outline;
+    self.outlineScroll.frame=NSMakeRect(0,30,MAX(0,side-OutlineEdgeWidth),height);self.outlineEdge.frame=NSMakeRect(MAX(0,side-OutlineEdgeWidth),30,OutlineEdgeWidth,height);
+    // 标题一列占满页码以外的宽度。
+    if(outline)[self.outlineView sizeToFit];
+    self.changeStrip.hidden=!DiffHints;self.changeStrip.frame=NSMakeRect(side,30,strip,height);
+    self.pdf.frame=NSMakeRect(side+strip,30,MAX(0,size.width-side-strip),height);[self refreshStrip];[self trackOutline];
 }
 - (void)jumpButton:(NSButton *)sender {NSMenuItem *item=[NSMenuItem new];item.representedObject=sender.identifier;[self jumpToPoint:item];}
 - (void)quickSetJumpPoint:(id)sender {if(self.pdf.document)[self queueJumpName:@"" snapshot:[self jumpSnapshot]];}
@@ -965,6 +1145,31 @@ static const CGFloat StripWidth=14,ChangeLine=.3;
             @"stripHidden":@(self.changeStrip.hidden),@"strip":NSStringFromRect(self.changeStrip.frame),@"pdf":NSStringFromRect(self.pdf.frame),@"buttonsHidden":@(self.previousChangeButton.hidden&&self.nextChangeButton.hidden),
             @"enabled":@(self.previousChangeButton.enabled&&self.nextChangeButton.enabled),@"menuEnabled":@([self validateMenuItem:self.nextChangeItem]),@"scrollX":@([self clipView].bounds.origin.x)};}
     if([op isEqual:@"testDiff"]){if(DiffHints!=[a[0] boolValue])[self toggleDiff:nil];return @0;}
+    // 文言：验纲目之栏。汉语：目录栏的测试钩子。rows 是当前可见的各行；top 是视口上缘所在的页与页坐标。
+    if([op isEqual:@"inspectOutline"]){NSMutableArray *rows=[NSMutableArray new];
+        for(NSInteger row=0;row<self.outlineView.numberOfRows;row++){OutlineNode *node=[self.outlineView itemAtRow:row];[rows addObject:@{@"title":node.title,@"page":node.label,@"index":@(node.page),@"y":@(node.y),@"level":@(node.level),@"expandable":@(node.children.count>0),@"expanded":@([self.outlineView isItemExpanded:node])}];}
+        NSPoint top=NSMakePoint(NSMidX(self.pdf.bounds),NSMaxY(self.pdf.bounds));PDFPage *page=self.pdf.document.pageCount?[self.pdf pageForPoint:top nearest:YES]:nil;
+        return @{@"shown":@(OutlineShown),@"visible":@(!self.outlineScroll.hidden),@"width":@(OutlineWidth),@"frame":NSStringFromRect(self.outlineScroll.frame),@"edge":NSStringFromRect(self.outlineEdge.frame),@"edgeHidden":@(self.outlineEdge.hidden),@"strip":NSStringFromRect(self.changeStrip.frame),@"pdf":NSStringFromRect(self.pdf.frame),@"bounds":NSStringFromRect(self.window.contentView.bounds),
+            @"rows":rows,@"selected":@(self.outlineView.selectedRow),@"entries":@(self.outlineOrder.count),@"states":(self.path?OutlineStates[self.path]:nil)?:@{},@"menuEnabled":@([self validateMenuItem:self.outlineItem]),@"menuOn":@(self.outlineItem.state==NSControlStateValueOn),@"key":self.outlineItem.keyEquivalent,
+            @"scrollY":@(self.outlineScroll.contentView.bounds.origin.y),@"topPage":@(page?(NSInteger)[self.pdf.document indexForPage:page]:-1),@"topY":@(page?[self.pdf convertPoint:top toPage:page].y:0),@"focused":@(self.window.firstResponder==self.outlineView)};}
+    if([op isEqual:@"testFit"]){[self fitWidth:nil];return @0;}
+    if([op isEqual:@"testOutline"]){if(OutlineShown!=[a[0] boolValue])[self toggleOutline:nil];return @0;}
+    if([op isEqual:@"testOutlineMenu"]){if(![self validateMenuItem:self.outlineItem])return @0;[NSApp sendAction:self.outlineItem.action to:self.outlineItem.target from:self.outlineItem];return @1;}
+    if([op isEqual:@"testOutlineShortcut"]){NSEvent *event=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:NSEventModifierFlagCommand|NSEventModifierFlagControl timestamp:0 windowNumber:self.window.windowNumber context:nil characters:@"s" charactersIgnoringModifiers:@"s" isARepeat:NO keyCode:1];return @([self.menuBar performKeyEquivalent:event]);}
+    if([op isEqual:@"testOutlineClick"]){[self showOutlineRow:[a[0] integerValue]];return @0;}
+    // 文言：以鼠击之，如用户然。汉语：向该行发送真正的鼠标按下与抬起事件（抬起事件先入队，供表格的跟踪循环取用），走用户点击的那条路。
+    if([op isEqual:@"testOutlineMouse"]){NSInteger row=[a[0] integerValue];if(row<0||row>=self.outlineView.numberOfRows)return @0;
+        NSRect cell=[self.outlineView frameOfCellAtColumn:0 row:row];NSPoint at=[self.outlineView convertPoint:NSMakePoint(NSMidX(cell),NSMidY(cell)) toView:nil];NSTimeInterval now=NSProcessInfo.processInfo.systemUptime;
+        NSEvent *down=[NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:at modifierFlags:0 timestamp:now windowNumber:self.window.windowNumber context:nil eventNumber:1 clickCount:1 pressure:1];
+        NSEvent *up=[NSEvent mouseEventWithType:NSEventTypeLeftMouseUp location:at modifierFlags:0 timestamp:now windowNumber:self.window.windowNumber context:nil eventNumber:2 clickCount:1 pressure:0];
+        [NSApp postEvent:up atStart:NO];[self.outlineView mouseDown:down];return @1;}
+    if([op isEqual:@"testOutlineExpand"]){id node=[self.outlineView itemAtRow:[a[0] integerValue]];if(!node)return @0;BOOL deep=a.count>2&&[a[2] boolValue];if([a[1] boolValue])[self.outlineView expandItem:node expandChildren:deep];else [self.outlineView collapseItem:node collapseChildren:deep];return @1;}
+    // 文言：击其开阖之钮，如用户然。汉语：找到该行真正的展开三角按钮并点击，与用户操作走同一条路。
+    if([op isEqual:@"testOutlineDisclosure"]){NSView *view=[self.outlineView rowViewAtRow:[a[0] integerValue] makeIfNecessary:YES];NSMutableArray<NSView *> *queue=[NSMutableArray new];if(view)[queue addObject:view];
+        while(queue.count){NSView *next=queue[0];[queue removeObjectAtIndex:0];if([next isKindOfClass:NSButton.class]&&[next.identifier isEqual:NSOutlineViewDisclosureButtonKey]){[(NSButton *)next performClick:nil];return @1;}[queue addObjectsFromArray:next.subviews];}
+        return @0;}
+    if([op isEqual:@"testOutlineWidth"]){[self outlineDragged:[a[0] doubleValue]-OutlineEdgeWidth/2 finished:[a[1] boolValue]];return @0;}
+    if([op isEqual:@"testOutlineScroll"]){NSClipView *clip=self.outlineScroll.contentView;[clip scrollToPoint:[clip constrainBoundsRect:(NSRect){NSMakePoint(0,[a[0] doubleValue]),clip.bounds.size}].origin];[self.outlineScroll reflectScrolledClipView:clip];return @0;}
     if([op isEqual:@"testDiffMenu"]){[NSApp sendAction:self.diffItem.action to:self.diffItem.target from:self.diffItem];return @0;}
     if([op isEqual:@"inspectDiff"]){NSMutableArray *texts=[NSMutableArray new];NSUInteger shown=0;
         for(NSArray *group in @[self.addedSelections?:@[],self.deletedSelections?:@[]]){NSMutableArray *list=[NSMutableArray new];[texts addObject:list];
@@ -998,7 +1203,10 @@ static id Dispatch(NSString *op,NSArray *args) {
     if(!Windows){Windows=[NSMutableArray new];Histories=[NSMutableDictionary new];DiffCache=[NSMutableDictionary new];
         // 文言：验时恒启，不读不写其好。汉语：后台测试模式固定开启且不读写用户偏好；正常运行时默认开启并记住选择。
         DiffHints=Background()||![NSUserDefaults.standardUserDefaults objectForKey:@"HighlightChanges"]||[NSUserDefaults.standardUserDefaults boolForKey:@"HighlightChanges"];
-        RemoveAsks=Background()||![NSUserDefaults.standardUserDefaults boolForKey:@"RemoveVersionsWithoutAsking"];}
+        RemoveAsks=Background()||![NSUserDefaults.standardUserDefaults boolForKey:@"RemoveVersionsWithoutAsking"];
+        // 目录栏默认显示；宽度与显隐在正常运行时记住，后台测试用默认值。
+        OutlineStates=[NSMutableDictionary new];OutlineShown=Background()||![NSUserDefaults.standardUserDefaults objectForKey:@"ShowOutline"]||[NSUserDefaults.standardUserDefaults boolForKey:@"ShowOutline"];
+        CGFloat width=Background()?0:[NSUserDefaults.standardUserDefaults doubleForKey:@"OutlineWidth"];if(width>=OutlineLeast&&width<=OutlineMost)OutlineWidth=width;}
     if([op isEqual:@"init"]){V=OpenWindow(args.count?args[0]:nil);return @0;}
     if([op isEqual:@"openNew"])return OpenWindow(args.count?args[0]:nil).windowID;
     if([op isEqual:@"inspectWindows"]){NSMutableArray *out=[NSMutableArray new];for(Viewer *viewer in Windows)[out addObject:@{@"id":viewer.windowID,@"path":viewer.path?:@""}];return out;}

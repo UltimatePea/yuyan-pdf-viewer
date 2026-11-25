@@ -15,5 +15,6 @@ node 测试/多窗.cjs
 node 测试/搜索.cjs
 node 测试/差异.cjs
 node 测试/改处.cjs
+node 测试/目录.cjs
 if [[ -n "${YY_CRASH_PDF:-}" ]]; then node 测试/崩溃.cjs; fi
 node 测试/工具栏.cjs

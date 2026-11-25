@@ -8,7 +8,7 @@ A native macOS PDF viewer for papers that are continuously rebuilt with LaTeX. A
 
 [Download the latest release](https://github.com/UltimatePea/yuyan-pdf-viewer/releases/latest).
 
-Unzip `Yuyan-PDF-Viewer-v0.2.9-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
+Unzip `Yuyan-PDF-Viewer-v0.2.10-macos-arm64.zip`, then open `阅卷.app` or move it to Applications.
 
 - **Apple Silicon (arm64), macOS 26 or newer.** Intel builds are not included.
 - Node/V8 and all non-system dynamic libraries are bundled. No Homebrew or Node installation is required to run the release.
@@ -29,6 +29,7 @@ Unzip `Yuyan-PDF-Viewer-v0.2.9-macos-arm64.zip`, then open `阅卷.app` or move 
 - PDF version history, stored on disk, with Previous, Next and Latest navigation and menu items to remove versions.
 - Change highlights between consecutive versions: added words in green, words the next version deletes in red. On by default; **View → Highlight Changes** turns them off.
 - An overview bar along the left edge marks where the changes are in the whole document, and **↑ / ↓** buttons step through them.
+- An outline panel on the left lists the PDF's own outline with page numbers; click an entry to go there. **View → Outline** (**⌃⌘S**) hides or shows it.
 - Optional Follow Edits mode and source-to-PDF navigation through a simple CLI.
 
 Anchoring is heuristic: extensive reflow, ambiguous text or formula-only content can fall back to the original page coordinates.
@@ -72,6 +73,17 @@ Each version is compared with its neighbours, word by word. Words **added** sinc
 The bar and the two buttons are hidden while highlights are off.
 
 The comparison is heuristic. It follows the order in which PDFKit extracts text, so reordered columns, moved floats and formulas whose extracted text changes can be marked. A word that differs only by a hyphen is not marked. A number that opens or ends a line apart from its text, as in some tables, is treated as a line number, and a line that repeats at the top or bottom of three or more pages as a header or footer. Where PDFKit glues a margin number to the last word of a line, the highlight leaves out that word's last letter, whose position PDFKit misreports.
+
+## Outline
+
+When a PDF has an outline (LaTeX with `hyperref` writes one), a panel at the left of the window lists it: the titles in one column and the page numbers in another. The overview bar stands between the panel and the PDF.
+
+- Click an entry to put its place at the top of the view. The keyboard stays with the PDF, so the arrow keys and Space keep scrolling the text.
+- The entry of the section you are reading is selected and follows as you scroll. If that section is inside a closed entry, the closed entry is selected. An entry you have just clicked stays selected until you scroll.
+- **View → Outline** (**⌃⌘S**) hides or shows the panel in every window, and the choice persists across launches. The panel is shown by default. A PDF without an outline has no panel, and the menu item is then disabled.
+- Drag the right edge of the panel to make it between 140 and 480 points wide; the width persists too. In a narrow window the panel yields room to the PDF. When the panel appears, disappears or changes width, fit-to-width refits the page and the reading passage stays in place.
+- Top-level entries start open and deeper ones follow the PDF. What you open or close is remembered for each PDF while the app runs. A rebuild keeps it, together with the selected entry and the scroll position of the panel; new and renamed entries appear with the new version.
+- Page numbers are the PDF's page labels, so front matter shows `iv` where the document numbers it so. An entry without a destination has no page number and does nothing when clicked.
 
 ## Jump points
 

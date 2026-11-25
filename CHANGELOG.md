@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.10 — 2026-11-25
+
+- Add an outline panel at the left of the window for PDFs that have an outline. It lists titles and page numbers. Clicking an entry puts its place at the top of the view, and the entry of the section being read is selected and follows scrolling.
+- Hide or show the panel with **View → Outline** (**⌃⌘S**). It is shown by default; the choice applies to every window and persists across launches. Drag the panel's right edge to resize it; the width persists too.
+- Keep the panel steady across rebuilds: the open and closed entries, the selected entry and the panel's scroll position stay as they were. Top-level entries start open.
+- Keep the reading passage and refit the page width when the panel appears, disappears or is resized.
+
 ## v0.2.9 — 2026-11-23
 
 - Store every version on disk, in `~/Library/Application Support/YuyanPDFViewer/Versions/`, so that the history and its change highlights are still there after the app is quit and reopened. A reopened PDF shows its latest stored version at once; older versions are read only when they are shown or compared.
